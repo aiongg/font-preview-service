@@ -19,4 +19,7 @@ jobs:
       github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
     uses: storytold/craft-common-actions/.github/workflows/sonarcloud.yml@main
+    with:
+      # One coverage job: the crate's single test would leave shards 2-4 with nothing to run.
+      shards: 1
     secrets: inherit
