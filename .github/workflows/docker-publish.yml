@@ -55,7 +55,7 @@ jobs:
           git -C fonts-src/noto checkout --detach "$NOTO_FONTS_SHA"
           # Noto CJK (separate repo, large OTFs).
           git clone --filter=blob:none --no-checkout --sparse https://github.com/notofonts/noto-cjk.git fonts-src/noto-cjk
-          git -C fonts-src/noto-cjk sparse-checkout set --no-cone /Sans/OTF/ /LICENSE
+          git -C fonts-src/noto-cjk sparse-checkout set --no-cone /Sans/OTF/ /Sans/LICENSE
           git -C fonts-src/noto-cjk checkout --detach "$NOTO_CJK_SHA"
           rm -rf fonts-src/*/.git
 

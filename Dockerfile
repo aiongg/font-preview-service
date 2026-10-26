@@ -24,7 +24,7 @@ COPY fonts-src/google/ufl /opt/fonts/google/ufl
 COPY fonts-src/noto/unhinted /opt/fonts/noto/unhinted
 COPY fonts-src/noto/LICENSE /opt/fonts/noto/LICENSE
 COPY fonts-src/noto-cjk/Sans/OTF /opt/fonts/noto-cjk/Sans/OTF
-COPY fonts-src/noto-cjk/LICENSE /opt/fonts/noto-cjk/LICENSE
+COPY fonts-src/noto-cjk/Sans/LICENSE /opt/fonts/noto-cjk/LICENSE
 
 ENV PORT=8000
 ENV FONTS_DIR=/opt/fonts
