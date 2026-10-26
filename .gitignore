@@ -1,0 +1,5 @@
+/target
+/fonts-src/
+.env
+.env.*
+!.env.example
