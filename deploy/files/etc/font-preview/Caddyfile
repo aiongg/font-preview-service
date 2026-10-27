@@ -6,6 +6,8 @@
 	# would loop. Clients reach HTTPS at Cloudflare either way.
 	auto_https disable_redirects
 	servers {
+		# Only TCP 80/443 are published, so no HTTP/3.
+		protocols h1 h2
 		trusted_proxies static {$FPS_TRUSTED_PROXIES}
 		client_ip_headers CF-Connecting-IP X-Forwarded-For
 	}
