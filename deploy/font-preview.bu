@@ -21,6 +21,19 @@ storage:
       contents: {local: etc/systemd/journald.conf.d/font-preview.conf}
     - path: /etc/font-preview/Caddyfile
       contents: {local: etc/font-preview/Caddyfile}
+    - path: /etc/font-preview/cloudflare-origin-pull-ca.pem
+      contents: {local: etc/font-preview/cloudflare-origin-pull-ca.pem}
+    - path: /etc/font-preview/cloudflare.sh
+      mode: 0755
+      contents: {local: etc/font-preview/cloudflare.sh}
+    - path: /etc/font-preview/cloudflare-v4.txt
+      contents: {local: etc/font-preview/cloudflare-v4.txt}
+    - path: /etc/font-preview/cloudflare-v6.txt
+      contents: {local: etc/font-preview/cloudflare-v6.txt}
+    - path: /etc/systemd/system/fps-cloudflare.service
+      contents: {local: etc/systemd/system/fps-cloudflare.service}
+    - path: /etc/systemd/system/fps-cloudflare.timer
+      contents: {local: etc/systemd/system/fps-cloudflare.timer}
     - path: /etc/font-preview/site.env
       contents: {local: etc/font-preview/site.env}
     - path: /etc/font-preview/release.env
@@ -41,4 +54,6 @@ systemd:
     - name: fps.service
       enabled: true
     - name: fps-proxy.service
+      enabled: true
+    - name: fps-cloudflare.timer
       enabled: true

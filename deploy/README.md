@@ -16,14 +16,38 @@ deploy/deploy.sh ignition <domain> <image@sha256:…> host.ign     # Ignition co
 | Unit | Does |
 |---|---|
 | `fps.service` | The service container on the internal `fps` network. Nonroot, read-only root, no capabilities, 1.2 GB memory, 1 CPU, 256 pids. |
-| `fps-proxy.service` | Caddy on host ports 80/443 (8080/8443 inside, nonroot). Certificates from Let's Encrypt, kept in `/var/lib/font-preview/caddy`. |
-| `iptables-restore`, `ip6tables-restore` | Incoming: SSH, ICMP, and 80/443 from Cloudflare's address ranges only. |
+| `fps-proxy.service` | Caddy on host ports 80/443 (IPv4; 8080/8443 inside, nonroot). Certificates from Let's Encrypt, kept in `/var/lib/font-preview/caddy`. Port 80 answers ACME challenges and redirects the rest. |
+| `iptables-restore`, `ip6tables-restore` | Incoming: SSH, ICMP, and 80/443 from Cloudflare's address ranges only. IPv6 forwarding to containers is dropped. |
+| `fps-cloudflare.timer` | Daily: fetches Cloudflare's ranges; when they changed, replaces the firewall's `DOCKER-USER` chain and Caddy's trusted proxies. A failed fetch keeps the current set. |
 
-- Images are pinned by digest in `/etc/font-preview/release.env`; the previous one is kept in `release.env.prev`. Caddy's and Butane's digests are in `versions.env`.
+- Images are pinned by digest in `/etc/font-preview/release.env`; the previous one is kept in `release.env.prev`. Caddy's and Butane's digests are in `versions.env`. Units pull an image only when it is missing, so a registry outage doesn't keep the service down after a reboot.
+- `deploy` pulls the new image before changing anything, rolls back when the restart or the health check fails, and afterwards removes images other than the current and previous ones.
 - Container logs go to journald: `journalctl -u fps -u fps-proxy`, capped at 500 MB.
 - Flatcar updates itself on the LTS channel and reboots only between 04:00 and 05:00 UTC. Everything is enabled, so it comes back after a reboot (about 35 s on a 1-vCPU host).
-- Caddy serves port 80 without redirecting to HTTPS, so every Cloudflare SSL mode works.
 
 ## Host-specific values
 
 None are stored here. The SSH destination and domain are arguments; Cloudflare's ranges are fetched at each `setup`. Re-run `setup` when they change.
+
+## Cloudflare settings (on the zone's account)
+
+1. SSL/TLS → Overview: encryption mode **Full (strict)**. The origin has a Let's Encrypt certificate, so strict validation works.
+2. SSL/TLS → Origin Server: turn on **Authenticated Origin Pulls** (zone-level, Cloudflare's certificate).
+3. Then re-run setup with origin pulls required, so only Cloudflare's origin-pull certificate is accepted on 443:
+
+   ```sh
+   ORIGIN_PULL=require deploy/deploy.sh setup <ssh-dest> <domain> <image@sha256:…>
+   ```
+
+Until step 3, Caddy verifies the client certificate when Cloudflare sends one and accepts connections without one, so the service keeps working whichever order the steps happen in.
+
+## Container contract (Flatcar now, Kubernetes later)
+
+The image runs the same way under these systemd units and under Kubernetes; the units here are one way to run it.
+
+- Configuration comes only from environment variables. Numeric nonroot UID (65532), read-only root filesystem, logs to stdout/stderr.
+- `font-preview-service` serves; `font-preview-service sync` fills the fonts volume and exits (a timer here; a CronJob, Job or initContainer elsewhere).
+- The server is stateless apart from the fonts volume, which it mounts read-only, so several replicas can share one volume (ReadOnlyMany). Only `sync` writes to it, into a new generation directory, and switches the `current` symlink atomically (rename).
+- The server notices a new generation itself by polling `current`; `SIGHUP` reloads at once.
+- `/healthz` is liveness; `/readyz` fails until a manifest is loaded. `SIGTERM` drains open requests, then exits.
+- Metrics are on their own port, not proxied.
