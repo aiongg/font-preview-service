@@ -16,6 +16,7 @@ const MAX_BUCKETS: usize = 100_000;
 pub struct RateLimiter {
     rate: f64,
     burst: f64,
+    max_buckets: usize,
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
 }
 
@@ -43,6 +44,7 @@ impl RateLimiter {
         Self {
             rate,
             burst,
+            max_buckets: MAX_BUCKETS,
             buckets: Mutex::new(HashMap::new()),
         }
     }
@@ -56,8 +58,11 @@ impl RateLimiter {
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if buckets.len() >= MAX_BUCKETS {
+        if buckets.len() >= self.max_buckets {
             self.prune_locked(&mut buckets, now);
+            if buckets.len() >= self.max_buckets {
+                evict_oldest(&mut buckets, self.max_buckets / 4);
+            }
         }
         let bucket = buckets.entry(key(ip)).or_insert(Bucket {
             tokens: self.burst,
@@ -90,6 +95,19 @@ impl RateLimiter {
     }
 }
 
+/// Drops at least `n` buckets, the least recently used first, so a full map is not rescanned on
+/// every request. Each evicted client starts again with a full bucket.
+fn evict_oldest(buckets: &mut HashMap<IpAddr, Bucket>, n: usize) {
+    let mut ages: Vec<Instant> = buckets.values().map(|b| b.at).collect();
+    if ages.is_empty() {
+        return;
+    }
+    let n = n.clamp(1, ages.len());
+    let (_, cutoff, _) = ages.select_nth_unstable(n - 1);
+    let cutoff = *cutoff;
+    buckets.retain(|_, b| b.at > cutoff);
+}
+
 /// The cap on subsets computed at once, with a short queue in front.
 pub struct Gate {
     slots: Arc<Semaphore>,
@@ -119,13 +137,22 @@ impl Gate {
         if let Some(permit) = self.try_acquire() {
             return Some(permit);
         }
-        if self.waiting.fetch_add(1, Ordering::AcqRel) >= self.queue {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
+        let queued = self.waiting.fetch_add(1, Ordering::AcqRel);
+        // Leaves the queue however this future ends, also when the client goes away mid-wait.
+        let _waiting = Waiting(&self.waiting);
+        if queued >= self.queue {
             return None;
         }
         let permit = tokio::time::timeout(QUEUE_WAIT, self.slots.clone().acquire_owned()).await;
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
         permit.ok()?.ok()
+    }
+}
+
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -170,5 +197,51 @@ mod tests {
         assert!(gate.acquire().await.is_none());
         drop(held);
         assert!(gate.acquire().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_wait_leaves_the_queue() {
+        let gate = Gate::new(1, 1);
+        let held = gate.acquire().await.unwrap();
+        tokio::select! {
+            _ = gate.acquire() => panic!("the slot is held"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        };
+        let (queued, ()) = tokio::join!(gate.acquire(), release);
+        assert!(
+            queued.is_some(),
+            "the cancelled wait gave its queue place back"
+        );
+    }
+
+    #[test]
+    fn a_full_map_of_fresh_buckets_evicts_the_oldest() {
+        let mut limiter = RateLimiter::new(1.0, 10.0);
+        limiter.max_buckets = 8;
+        let t0 = Instant::now();
+        for i in 0..8u8 {
+            let ip = IpAddr::from([192, 0, 2, i]);
+            limiter
+                .check(ip, t0 + Duration::from_millis(u64::from(i)))
+                .unwrap();
+        }
+        limiter
+            .check(
+                "198.51.100.1".parse().unwrap(),
+                t0 + Duration::from_millis(10),
+            )
+            .unwrap();
+        let buckets = limiter.buckets.lock().unwrap();
+        assert_eq!(
+            buckets.len(),
+            7,
+            "the two oldest went, the new client came in"
+        );
+        assert!(!buckets.contains_key(&IpAddr::from([192, 0, 2, 0])));
+        assert!(!buckets.contains_key(&IpAddr::from([192, 0, 2, 1])));
     }
 }

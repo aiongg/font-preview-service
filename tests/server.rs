@@ -19,10 +19,11 @@ const ORBITRON: &[u8] = include_bytes!("data/orbitron/Orbitron[wght].ttf");
 const OFL: &[u8] = include_bytes!("data/abeezee/OFL.txt");
 const NOTICE: &[u8] = b"Notice for the Sarabun fixture.\n";
 const THAI: &str = "โดยที่การไม่นำพาและการหมิ่นในคุณค่าของสิทธิมนุษยชน";
+const LATIN: &str = "Whereas recognition of the inherent dignity";
 
 fn samples() -> Value {
     json!({
-        "Latn": {"text": "Whereas recognition of the inherent dignity", "method": "udhr", "language": "en_Latn"},
+        "Latn": {"text": LATIN, "method": "udhr", "language": "en_Latn"},
         "Thai": {"text": THAI, "method": "udhr", "language": "th_Thai"},
     })
 }
@@ -119,6 +120,11 @@ fn face_url(font: &[u8], inst: &str, file: &str) -> String {
     format!("/v1/faces/{}/{inst}/{file}", sha(font))
 }
 
+/// The sample file name for a face whose sample text is `text`.
+fn sample(text: &str) -> String {
+    format!("sample-{}.woff2", &sha(text.as_bytes())[..12])
+}
+
 #[tokio::test]
 async fn healthz_returns_ok() {
     let app = App::new(Config::new("/nonexistent"));
@@ -130,7 +136,7 @@ async fn healthz_returns_ok() {
 #[tokio::test]
 async fn sample_is_immutable_with_an_etag() {
     let app = app();
-    let url = face_url(ABEEZEE, "list", "sample.woff2");
+    let url = face_url(ABEEZEE, "list", &sample(LATIN));
     let (status, headers, body) = get(&app, &url, &[]).await;
     assert_eq!(status, 200);
     assert_eq!(headers["content-type"], "font/woff2");
@@ -149,12 +155,12 @@ async fn sample_is_immutable_with_an_etag() {
     assert!(body.is_empty());
 
     // For a static face every instance is the face itself.
-    let (status, headers, _) = get(&app, &face_url(ABEEZEE, "var", "sample.woff2"), &[]).await;
+    let (status, headers, _) = get(&app, &face_url(ABEEZEE, "var", &sample(LATIN)), &[]).await;
     assert_eq!(
         (status, headers["etag"].to_str().unwrap()),
         (StatusCode::OK, etag.as_str())
     );
-    let (status, ..) = get(&app, &face_url(ABEEZEE, "wght400", "sample.woff2"), &[]).await;
+    let (status, ..) = get(&app, &face_url(ABEEZEE, "wght400", &sample(LATIN)), &[]).await;
     assert_eq!(status, 404);
 }
 
@@ -163,7 +169,11 @@ async fn unknown_faces_and_bad_codepoints_are_refused() {
     let app = app();
     let unknown = "0".repeat(64);
     for uri in [
-        format!("/v1/faces/{unknown}/list/sample.woff2"),
+        format!("/v1/faces/{unknown}/list/{}", sample(LATIN)),
+        face_url(ABEEZEE, "list", "sample.woff2"),
+        face_url(ABEEZEE, "list", &sample(THAI)),
+        face_url(SARABUN, "list", &sample(LATIN)),
+        face_url(ABEEZEE, "list", "sample-.woff2"),
         format!("/v1/files/{unknown}"),
         format!("/v1/licences/{}", sha(ABEEZEE)),
         face_url(ABEEZEE, "list", "u/41.ttf"),
@@ -182,12 +192,29 @@ async fn unknown_faces_and_bad_codepoints_are_refused() {
         .await;
         assert_eq!(status, 400, "{cps}");
     }
+    let (status, headers, _) = get(&app, &face_url(SARABUN, "list", &sample(THAI)), &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    for file in [
+        &sample(LATIN),
+        "u/41.woff2",
+        "u/%34%31.woff2",
+        "ascii%2ewoff2",
+    ] {
+        let encoded = face_url(ABEEZEE, "list", file).replace("/list/", "/l%69st/");
+        let (status, headers, _) = get(&app, &encoded, &[]).await;
+        assert_eq!(status, 400, "{encoded}");
+        assert_eq!(headers["access-control-allow-origin"], "*");
+    }
 }
 
 #[tokio::test]
 async fn named_instances_are_accepted_in_their_exact_form_only() {
     let app = app();
-    let precomputed = get(&app, &face_url(ORBITRON, "var", "sample.woff2"), &[]).await;
+    let precomputed = get(&app, &face_url(ORBITRON, "var", &sample(LATIN)), &[]).await;
     assert_eq!(precomputed.0, 200);
     let ttf = wuff::decompress_woff2(&precomputed.2).unwrap();
     assert!(
@@ -195,17 +222,24 @@ async fn named_instances_are_accepted_in_their_exact_form_only() {
         "var keeps fvar"
     );
 
-    let (status, _, body) = get(&app, &face_url(ORBITRON, "wght700", "sample.woff2"), &[]).await;
+    let (status, _, body) = get(&app, &face_url(ORBITRON, "wght700", &sample(LATIN)), &[]).await;
     assert_eq!(status, 200);
     let ttf = wuff::decompress_woff2(&body).unwrap();
     assert!(
         FontRef::new(&ttf).unwrap().axes().is_empty(),
         "pinned to Bold"
     );
-    for inst in ["wght700.0", "wght%20700", "wght600", "WGHT700"] {
-        let (status, ..) = get(&app, &face_url(ORBITRON, inst, "sample.woff2"), &[]).await;
+    for inst in ["wght700.0", "wght600", "WGHT700"] {
+        let (status, ..) = get(&app, &face_url(ORBITRON, inst, &sample(LATIN)), &[]).await;
         assert_eq!(status, 404, "{inst}");
     }
+    let (status, ..) = get(
+        &app,
+        &face_url(ORBITRON, "wght%37%30%30", &sample(LATIN)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 400, "an encoded form of wght700");
     let (status, ..) = get(&app, &face_url(ORBITRON, "wght400", "ascii.woff2"), &[]).await;
     assert_eq!(status, 200);
 }
@@ -274,6 +308,10 @@ async fn files_and_licences_are_mirrored() {
     assert_eq!(status, 200);
     assert_eq!(&body[..], ABEEZEE);
     assert_eq!(headers["content-type"], "font/ttf");
+    assert_eq!(
+        headers["content-length"],
+        ABEEZEE.len().to_string().as_str()
+    );
     assert_eq!(headers["vary"], "Accept-Encoding");
     assert!(headers.get("content-encoding").is_none());
 
@@ -286,13 +324,15 @@ async fn files_and_licences_are_mirrored() {
     let (status, ..) = get(&app, &url, &[("accept-encoding", "br;q=0")]).await;
     assert_eq!(status, 200);
     let etag = headers["etag"].to_str().unwrap();
-    let (status, ..) = get(
+    let (status, headers, _) = get(
         &app,
         &url,
         &[("accept-encoding", "br"), ("if-none-match", etag)],
     )
     .await;
     assert_eq!(status, 304);
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(headers["vary"], "Accept-Encoding");
 
     for (text, file) in [(OFL, sha(OFL)), (NOTICE, sha(NOTICE))] {
         let (status, headers, body) = get(&app, &format!("/v1/licences/{file}"), &[]).await;
@@ -342,6 +382,32 @@ async fn readiness_follows_the_loaded_generation() {
     assert!(!app.reload().unwrap(), "unchanged");
     let body = get(&app, "/v1/manifest.json", &[]).await.2;
     assert_eq!(manifest_generation(body), generation(2));
-    let (status, ..) = get(&app, &face_url(ABEEZEE, "list", "sample.woff2"), &[]).await;
+    let (status, ..) = get(&app, &face_url(ABEEZEE, "list", &sample(LATIN)), &[]).await;
     assert_eq!(status, 200);
+
+    app.begin_shutdown();
+    assert_eq!(get(&app, "/readyz", &[]).await.0, 503);
+    assert_eq!(get(&app, "/healthz", &[]).await.0, 200);
+}
+
+#[tokio::test]
+async fn compression_spends_on_demand_tokens() {
+    let mut cfg = Config::new(volume());
+    cfg.burst = 1.0;
+    cfg.rate_per_s = 0.001;
+    let app = app_with(cfg);
+    let br = [("accept-encoding", "br")];
+    let abeezee = format!("/v1/files/{}", sha(ABEEZEE));
+    let (status, headers, _) = get(&app, &abeezee, &br).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-encoding"], "br");
+    let (status, headers, body) = get(&app, &format!("/v1/files/{}", sha(SARABUN)), &br).await;
+    assert_eq!(status, 200, "out of tokens: sent as it is");
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(&body[..], SARABUN);
+    let (_, headers, _) = get(&app, &abeezee, &br).await;
+    assert_eq!(
+        headers["content-encoding"], "br",
+        "cached results need no token"
+    );
 }

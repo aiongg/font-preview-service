@@ -17,15 +17,19 @@ use axum::routing::get;
 use craft_font_store::sha256_hex;
 use skrifa::{FontRef, MetadataProvider};
 use std::collections::BTreeSet;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::SeekFrom;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const WOFF2: &str = "font/woff2";
 /// Downloads up to this size are brotli-compressed for clients that accept it.
 const MAX_BR_FILE: u64 = 16 << 20;
+/// Read size of streamed downloads.
+const STREAM_CHUNK: usize = 64 << 10;
 
 type AppState = State<Arc<App>>;
 
@@ -36,7 +40,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/manifest.json", get(manifest))
         .route("/v1/files/{sha256}", get(file))
         .route("/v1/licences/{sha256}", get(licence))
-        .route("/v1/faces/{sha256}/{inst}/sample.woff2", get(sample))
+        .route("/v1/faces/{sha256}/{inst}/sample-{file}", get(sample))
         .route("/v1/faces/{sha256}/{inst}/ascii.woff2", get(ascii))
         .route("/v1/faces/{sha256}/{inst}/u/{codepoints}", get(text))
         .fallback(|| async { not_found() })
@@ -51,8 +55,18 @@ async fn track(State(app): AppState, req: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map_or("other", MatchedPath::as_str)
         .to_owned();
-    let v1 = req.uri().path().starts_with("/v1/");
-    let mut response = next.run(req).await;
+    let path = req.uri().path();
+    let v1 = path.starts_with("/v1/");
+    // Axum decodes path segments, so an encoded form would get past the canonical-form checks;
+    // canonical face URLs never contain `%`.
+    let mut response = if path.starts_with("/v1/faces/") && path.contains('%') {
+        error(
+            StatusCode::BAD_REQUEST,
+            "percent-encoding is not allowed in face URLs\n",
+        )
+    } else {
+        next.run(req).await
+    };
     if v1 {
         response.headers_mut().insert(
             header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -87,6 +101,9 @@ fn not_ready() -> Response {
 }
 
 async fn readyz(State(app): AppState) -> Response {
+    if app.shutting_down() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "shutting down\n");
+    }
     match app.generation() {
         Some(_) => "ready".into_response(),
         None => not_ready(),
@@ -121,7 +138,7 @@ fn matches(headers: &HeaderMap, etag: &str) -> bool {
 /// An immutable response, or 304 when the client already has it.
 fn immutable(
     headers: &HeaderMap,
-    body: Bytes,
+    body: impl Into<Body>,
     etag: &str,
     content_type: &'static str,
     extra: &[(header::HeaderName, &'static str)],
@@ -130,7 +147,7 @@ fn immutable(
     let mut response = if not_modified {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
-        Response::new(Body::from(body))
+        Response::new(body.into())
     };
     let h = response.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(IMMUTABLE));
@@ -141,6 +158,10 @@ fn immutable(
         h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     }
     for (name, value) in extra {
+        // A 304 describes the representation without sending it.
+        if not_modified && *name == header::CONTENT_ENCODING {
+            continue;
+        }
         h.insert(name.clone(), HeaderValue::from_static(value));
     }
     response
@@ -167,7 +188,7 @@ fn respond_cached(
             content_type,
             extra,
         ),
-        Cached::Failed => error(StatusCode::INTERNAL_SERVER_ERROR, "subsetting failed\n"),
+        Cached::Failed { .. } => error(StatusCode::INTERNAL_SERVER_ERROR, "subsetting failed\n"),
     }
 }
 
@@ -188,7 +209,8 @@ fn client_ip(app: &App, req: &Parts) -> IpAddr {
 }
 
 enum Want {
-    Sample,
+    /// The sample text, whose hash the URL names.
+    Sample(String),
     Ascii,
     /// Canonical codepoint string and its codepoints.
     Text(String, Vec<u32>),
@@ -216,10 +238,13 @@ fn resolve(face: &Face, inst: &str) -> Option<(Which, String)> {
 
 async fn sample(
     State(app): AppState,
-    Path((sha, inst)): Path<(String, String)>,
+    Path((sha, inst, file)): Path<(String, String, String)>,
     req: Parts,
 ) -> Response {
-    face(app, sha, inst, Want::Sample, req).await
+    let Some(hash) = file.strip_suffix(".woff2") else {
+        return not_found();
+    };
+    face(app, sha, inst, Want::Sample(hash.to_owned()), req).await
 }
 
 async fn ascii(
@@ -260,9 +285,15 @@ async fn face(app: Arc<App>, sha: String, inst: String, want: Want, req: Parts) 
     let Some((which, inst_key)) = resolve(face, &inst) else {
         return not_found();
     };
+    // A URL for another sample text, from before an index change, falls back to `u/`.
+    if let Want::Sample(hash) = &want
+        && face.sample_hash.as_ref() != Some(hash)
+    {
+        return not_found();
+    }
     let precomputed = match (&want, &which) {
-        (Want::Sample, Which::List) => Some((SAMPLE, face.has_sample)),
-        (Want::Sample, Which::Var) => Some((VAR, face.has_var)),
+        (Want::Sample(_), Which::List) => Some((SAMPLE, face.has_sample)),
+        (Want::Sample(_), Which::Var) => Some((VAR, face.has_var)),
         (Want::Ascii, Which::List) => Some((ASCII, face.has_ascii)),
         _ => None,
     };
@@ -288,16 +319,13 @@ async fn face(app: Arc<App>, sha: String, inst: String, want: Want, req: Parts) 
             "ascii".to_owned(),
             false,
         ),
-        Want::Sample => {
+        Want::Sample(hash) => {
             let Some(text) = &face.sample else {
                 return not_found();
             };
             let mut cps = codepoints::of_text(text);
             cps.extend(codepoints::of_text(&face.family));
-            // A new index may give the face another sample text.
-            let mut hasher = DefaultHasher::new();
-            text.hash(&mut hasher);
-            (cps, format!("sample:{:016x}", hasher.finish()), false)
+            (cps, format!("sample-{hash}"), false)
         }
         Want::Text(canonical, cps) => (cps.into_iter().collect(), format!("u:{canonical}"), true),
     };
@@ -306,8 +334,9 @@ async fn face(app: Arc<App>, sha: String, inst: String, want: Want, req: Parts) 
         Which::Var => Instance::Var,
         Which::Named(i) => i,
     };
+    // Entries are derived from one generation's index, so a new generation never reads them.
     let job = Job {
-        key: format!("{sha}/{inst_key}/{kind}"),
+        key: format!("{}/{sha}/{inst_key}/{kind}", generation.name),
         sha,
         instance,
         cps,
@@ -332,7 +361,7 @@ async fn on_demand(app: Arc<App>, generation: Arc<Generation>, job: Job, req: Pa
         r.headers_mut().insert(header::RETRY_AFTER, secs.into());
         return r;
     }
-    if let Some(cached) = app.responses.get(&job.key) {
+    if let Some(cached) = app.cached(&job.key) {
         inc(&app.metrics.response_hits);
         return respond_cached(&req.headers, &cached, &[]);
     }
@@ -366,7 +395,7 @@ async fn on_demand(app: Arc<App>, generation: Arc<Generation>, job: Job, req: Pa
             if !keep {
                 return error(StatusCode::INTERNAL_SERVER_ERROR, "subsetting failed\n");
             }
-            Cached::Failed
+            Cached::Failed { at: Instant::now() }
         }
     };
     let cached = Arc::new(cached);
@@ -459,65 +488,97 @@ async fn file(State(app): AppState, Path(sha): Path<String>, req: Parts) -> Resp
     let Some(face) = generation.faces.get(&sha) else {
         return not_found();
     };
-    let size = face.size;
     let headers = &req.headers;
-    let br = accepts_br(headers) && size <= MAX_BR_FILE;
-    if br {
-        let key = format!("br/{sha}");
-        let br_headers = [VARY, (header::CONTENT_ENCODING, "br")];
-        if let Some(cached) = app.responses.get(&key) {
-            inc(&app.metrics.response_hits);
-            return respond_cached(headers, &cached, &br_headers);
-        }
-        // Compression waits for nobody: without a free slot the download goes out uncompressed.
-        if let Some(permit) = app.gate.try_acquire() {
-            inc(&app.metrics.response_misses);
-            let worker = app.clone();
-            let blob = sha.clone();
-            let compressed = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let bytes = worker.face_bytes(&blob, size)?;
-                let mut out = Vec::new();
-                let params = brotli::enc::BrotliEncoderParams {
-                    quality: 5,
-                    size_hint: bytes.len(),
-                    ..Default::default()
-                };
-                brotli::BrotliCompress(&mut &bytes[..], &mut out, &params)?;
-                Ok::<_, std::io::Error>((font_type(&bytes), out))
-            })
-            .await;
-            if let Ok(Ok((content_type, out))) = compressed {
-                let cached = Arc::new(Cached::Ok {
-                    body: Bytes::from(out),
-                    etag: HeaderValue::from_str(&format!("\"{sha}-br\""))
-                        .unwrap_or(HeaderValue::from_static("\"\"")),
-                    content_type,
-                });
-                app.responses
-                    .put(key.clone(), cached.clone(), cached.weight(&key));
-                return respond_cached(headers, &cached, &br_headers);
-            }
-        }
+    if accepts_br(headers)
+        && face.size <= MAX_BR_FILE
+        && let Some(response) = compressed_file(&app, &sha, &req).await
+    {
+        return response;
     }
     let etag = format!("\"{sha}\"");
     if matches(headers, &etag) {
         return immutable(headers, Bytes::new(), &etag, "", &[VARY]);
     }
-    let worker = app.clone();
-    let blob = sha.clone();
-    match tokio::task::spawn_blocking(move || worker.face_bytes(&blob, size)).await {
-        Ok(Ok(bytes)) => {
-            let content_type = font_type(&bytes);
-            immutable(headers, bytes, &etag, content_type, &[VARY])
-        }
-        Ok(Err(e)) => {
-            eprintln!("reading file {sha}: {e}");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "read failed\n")
+    match open_file(&app, &sha).await {
+        Ok((file, len, content_type)) => {
+            let body = Body::from_stream(ReaderStream::with_capacity(file, STREAM_CHUNK));
+            let mut response = immutable(headers, body, &etag, content_type, &[VARY]);
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, len.into());
+            response
         }
         Err(e) => {
             eprintln!("reading file {sha}: {e}");
             error(StatusCode::INTERNAL_SERVER_ERROR, "read failed\n")
         }
     }
+}
+
+/// The font file at its start, with its length and media type.
+async fn open_file(app: &App, sha: &str) -> std::io::Result<(tokio::fs::File, u64, &'static str)> {
+    let mut file = tokio::fs::File::open(app.store.path(Kind::File, sha)).await?;
+    let len = file.metadata().await?.len();
+    let mut head = [0u8; 4];
+    let mut n = 0;
+    while n < head.len() {
+        match file.read(&mut head[n..]).await? {
+            0 => break,
+            read => n += read,
+        }
+    }
+    file.seek(SeekFrom::Start(0)).await?;
+    Ok((file, len, font_type(&head[..n])))
+}
+
+/// The brotli download, or `None` to send the file as it is. Compression waits for nobody and
+/// spends the client's on-demand tokens: without the free compression slot or a token, or when
+/// compressing fails, the download goes out uncompressed.
+async fn compressed_file(app: &Arc<App>, sha: &str, req: &Parts) -> Option<Response> {
+    let headers = &req.headers;
+    let br_headers = [VARY, (header::CONTENT_ENCODING, "br")];
+    let etag = format!("\"{sha}-br\"");
+    if matches(headers, &etag) {
+        return Some(immutable(headers, Bytes::new(), &etag, "", &br_headers));
+    }
+    if let Some(cached) = app.files_br.get(sha) {
+        inc(&app.metrics.files_br_hits);
+        return Some(respond_cached(headers, &cached, &br_headers));
+    }
+    let permit = app.br_slot.clone().try_acquire_owned().ok()?;
+    app.limiter
+        .check(client_ip(app, req), Instant::now())
+        .ok()?;
+    inc(&app.metrics.files_br_misses);
+    let path = app.store.path(Kind::File, sha);
+    let compressed = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let bytes = std::fs::read(path)?;
+        let mut out = Vec::new();
+        let params = brotli::enc::BrotliEncoderParams {
+            quality: 5,
+            size_hint: bytes.len(),
+            ..Default::default()
+        };
+        brotli::BrotliCompress(&mut &bytes[..], &mut out, &params)?;
+        Ok::<_, std::io::Error>((font_type(&bytes), out))
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|r| r);
+    let (content_type, out) = match compressed {
+        Ok(done) => done,
+        Err(e) => {
+            eprintln!("compressing file {sha}: {e}");
+            return None;
+        }
+    };
+    let cached = Arc::new(Cached::Ok {
+        body: Bytes::from(out),
+        etag: HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\"")),
+        content_type,
+    });
+    app.files_br
+        .put(sha.to_owned(), cached.clone(), cached.weight(sha));
+    Some(respond_cached(headers, &cached, &br_headers))
 }

@@ -12,8 +12,10 @@ use std::path::PathBuf;
 /// | `ONDEMAND_BURST` | 200 | per-IP bucket size |
 /// | `ONDEMAND_CONCURRENCY` | available parallelism | subsets computed at once |
 /// | `ONDEMAND_QUEUE` | 4 × concurrency | requests that may wait for a slot; beyond it, 503 |
-/// | `FACE_CACHE` | 500 | font files kept in memory (each at most 64 MB) |
-/// | `RESPONSE_CACHE_MB` | 256 | on-demand results and compressed file downloads |
+/// | `FACE_CACHE` | 500 | font files the subsetter keeps in memory (each at most 64 MB) |
+/// | `FACE_CACHE_MB` | 256 | summed size of those font files |
+/// | `RESPONSE_CACHE_MB` | 256 | on-demand results |
+/// | `FILES_BR_CACHE_MB` | 64 | brotli-compressed file downloads |
 /// | `CLIENT_IP_HEADER` | unset | header with the client address, set by the proxy in front |
 ///
 /// Without `CLIENT_IP_HEADER` the client is the peer address. With it, the server takes the
@@ -31,7 +33,9 @@ pub struct Config {
     pub concurrency: usize,
     pub queue: usize,
     pub face_cache: usize,
+    pub face_cache_bytes: u64,
     pub response_cache_bytes: u64,
+    pub files_br_cache_bytes: u64,
     pub client_ip_header: Option<HeaderName>,
 }
 
@@ -48,7 +52,9 @@ impl Config {
             concurrency,
             queue: 4 * concurrency,
             face_cache: 500,
+            face_cache_bytes: 256 << 20,
             response_cache_bytes: 256 << 20,
+            files_br_cache_bytes: 64 << 20,
             client_ip_header: None,
         }
     }
@@ -92,8 +98,15 @@ impl Config {
         if let Some(n) = parse("FACE_CACHE", get("FACE_CACHE"))? {
             cfg.face_cache = n;
         }
-        if let Some(mb) = parse::<u64>("RESPONSE_CACHE_MB", get("RESPONSE_CACHE_MB"))? {
-            cfg.response_cache_bytes = mb << 20;
+        let mb = |key: &str| parse::<u64>(key, get(key)).map(|v| v.map(|mb| mb << 20));
+        if let Some(b) = mb("FACE_CACHE_MB")? {
+            cfg.face_cache_bytes = b;
+        }
+        if let Some(b) = mb("RESPONSE_CACHE_MB")? {
+            cfg.response_cache_bytes = b;
+        }
+        if let Some(b) = mb("FILES_BR_CACHE_MB")? {
+            cfg.files_br_cache_bytes = b;
         }
         if let Some(h) = get("CLIENT_IP_HEADER") {
             cfg.client_ip_header = Some(
@@ -159,11 +172,14 @@ mod tests {
             ("FONTS_DIR", "/fonts"),
             ("ONDEMAND_CONCURRENCY", "3"),
             ("RESPONSE_CACHE_MB", "8"),
+            ("FACE_CACHE_MB", "32"),
             ("CLIENT_IP_HEADER", "CF-Connecting-IP"),
         ]))
         .unwrap();
         assert_eq!((cfg.concurrency, cfg.queue), (3, 12));
         assert_eq!(cfg.response_cache_bytes, 8 << 20);
+        assert_eq!(cfg.face_cache_bytes, 32 << 20);
+        assert_eq!(cfg.files_br_cache_bytes, 64 << 20);
         assert_eq!(cfg.client_ip_header.unwrap().as_str(), "cf-connecting-ip");
         for (key, bad) in [
             ("ONDEMAND_CONCURRENCY", "0"),

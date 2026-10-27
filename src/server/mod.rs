@@ -20,15 +20,18 @@ use cache::Lru;
 use limit::RateLimiter;
 use metrics::{Metrics, Summary, inc};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 /// Font files larger than this are read for each use instead of kept in the face cache.
 const MAX_CACHED_FACE: u64 = 64 << 20;
 const POLL: Duration = Duration::from_secs(30);
 const SUMMARY: Duration = Duration::from_secs(300);
 const DRAIN: Duration = Duration::from_secs(10);
+/// How long a failed subset is answered from the cache before it is tried again.
+const FAILED_TTL: Duration = Duration::from_secs(300);
 
 /// An on-demand result or compressed download in the response cache.
 pub(crate) enum Cached {
@@ -37,17 +40,25 @@ pub(crate) enum Cached {
         etag: HeaderValue,
         content_type: &'static str,
     },
-    /// The subset failed; kept so the same request is not computed again.
-    Failed,
+    /// The subset failed at `at`; kept for [`FAILED_TTL`] so the same request is not computed
+    /// again at once.
+    Failed { at: Instant },
 }
 
 impl Cached {
     fn weight(&self, key: &str) -> u64 {
         let body = match self {
             Cached::Ok { body, .. } => body.len(),
-            Cached::Failed => 0,
+            Cached::Failed { .. } => 0,
         };
         (body + key.len() + 128) as u64
+    }
+
+    fn fresh(&self) -> bool {
+        match self {
+            Cached::Ok { .. } => true,
+            Cached::Failed { at } => at.elapsed() < FAILED_TTL,
+        }
     }
 }
 
@@ -56,11 +67,16 @@ pub struct App {
     store: Store,
     current: RwLock<Option<Arc<Generation>>>,
     last_error: Mutex<Option<String>>,
+    /// Font files for the subsetter.
     faces: Lru<Bytes>,
     responses: Lru<Arc<Cached>>,
+    /// Brotli-compressed `/v1/files` downloads, and the one slot that compresses them.
+    files_br: Lru<Arc<Cached>>,
+    br_slot: Arc<Semaphore>,
     limiter: RateLimiter,
     gate: Gate,
     metrics: Metrics,
+    stopping: AtomicBool,
 }
 
 impl App {
@@ -69,11 +85,14 @@ impl App {
             store: Store::new(&config.fonts_dir),
             current: RwLock::new(None),
             last_error: Mutex::new(None),
-            faces: Lru::new(config.face_cache, u64::MAX),
+            faces: Lru::new(config.face_cache, config.face_cache_bytes),
             responses: Lru::new(usize::MAX, config.response_cache_bytes),
+            files_br: Lru::new(usize::MAX, config.files_br_cache_bytes),
+            br_slot: Arc::new(Semaphore::new(1)),
             limiter: RateLimiter::new(config.rate_per_s, config.burst),
             gate: Gate::new(config.concurrency, config.queue),
             metrics: Metrics::default(),
+            stopping: AtomicBool::new(false),
             config,
         })
     }
@@ -89,6 +108,20 @@ impl App {
     /// The subsetting slots of the on-demand routes.
     pub fn gate(&self) -> &Gate {
         &self.gate
+    }
+
+    /// Marks the server as shutting down: `/readyz` answers 503 from now on.
+    pub fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
+    }
+
+    fn shutting_down(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// A response-cache entry, unless it is a failure older than [`FAILED_TTL`].
+    fn cached(&self, key: &str) -> Option<Arc<Cached>> {
+        self.responses.get(key).filter(|c| c.fresh())
     }
 
     /// Resolves `current` once and loads that generation if it is not the one being served.
@@ -157,17 +190,22 @@ impl App {
                 async move {
                     let (fe, fb) = app.faces.size();
                     let (re, rb) = app.responses.size();
+                    let (be, bb) = app.files_br.size();
                     (
                         [("content-type", "text/plain; version=0.0.4")],
-                        app.metrics
-                            .render(&[("face", fe, fb), ("response", re, rb)]),
+                        app.metrics.render(&[
+                            ("face", fe, fb),
+                            ("response", re, rb),
+                            ("files_br", be, bb),
+                        ]),
                     )
                 }
             }),
         )
     }
 
-    /// The font file `sha256`, from the face cache or disk. Blocking.
+    /// The font file `sha256` for the subsetter, from the face cache or disk. Blocking; callers
+    /// hold a gate slot, so at most `ONDEMAND_CONCURRENCY` reads run at once.
     fn face_bytes(&self, sha256: &str, size: u64) -> std::io::Result<Bytes> {
         if let Some(bytes) = self.faces.get(sha256) {
             inc(&self.metrics.face_hits);
@@ -226,7 +264,10 @@ async fn signals(app: Arc<App>, stop: watch::Sender<bool>) {
         signal(SignalKind::interrupt()),
         signal(SignalKind::hangup()),
     ) else {
-        eprintln!("cannot install signal handlers");
+        // Dropping `stop` would start the shutdown, so the server runs on without signals.
+        eprintln!("cannot install signal handlers; SIGTERM, SIGINT and SIGHUP are not handled");
+        std::future::pending::<()>().await;
+        drop(stop);
         return;
     };
     loop {
@@ -240,6 +281,7 @@ async fn signals(app: Arc<App>, stop: watch::Sender<bool>) {
         "stopping: draining open requests for up to {} s",
         DRAIN.as_secs()
     );
+    app.begin_shutdown();
     let _ = stop.send(true);
 }
 

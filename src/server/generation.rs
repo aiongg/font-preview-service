@@ -30,6 +30,8 @@ pub struct Face {
     /// Named instances by their `{inst}` string.
     pub named: HashMap<String, Instance>,
     pub sample: Option<Arc<str>>,
+    /// The `{h}` of the face's `sample-{h}.woff2` URLs; without it the face has none.
+    pub sample_hash: Option<String>,
     pub has_sample: bool,
     pub has_ascii: bool,
     pub has_var: bool,
@@ -109,6 +111,7 @@ pub fn load(store: &Store, name: &str, limits: &Limits) -> Result<Generation, St
                 list,
                 named,
                 sample: f.sample.and_then(|i| samples.get(i).cloned()),
+                sample_hash: f.sample_hash.clone(),
                 has_sample: has(SAMPLE),
                 has_ascii: has(ASCII),
                 has_var: has(VAR),

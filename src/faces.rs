@@ -8,7 +8,8 @@
 //!  "faces": {"<sha256>": {"family": "Orbitron", "license": "OFL", "reserved_names": ["Orbitron"],
 //!    "size": 38260, "axes": ["wght"],
 //!    "instances": [{"name": "Regular", "coordinates": {"wght": 400.0}}],
-//!    "list": {"wght": 400.0}, "sample": 0, "statics": ["sample", "ascii", "var"]}}}
+//!    "list": {"wght": 400.0}, "sample": 0, "sample_hash": "a79fe905fc38",
+//!    "statics": ["sample", "ascii", "var"]}}}
 //! ```
 //!
 //! The font file is at `files/<first 2 hex>/<sha256>` ([`crate::store::Store::path`]).
@@ -54,6 +55,9 @@ pub struct FaceRecord {
     /// Position of the face's sample text in [`Faces::samples`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<usize>,
+    /// [`sample_hash`] of that text, the `{h}` of the face's `sample-{h}.woff2` URLs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_hash: Option<String>,
     /// The precomputed static files present: `sample`, `ascii`, `var`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statics: Vec<String>,
@@ -67,6 +71,14 @@ pub fn instance_name(coordinates: &BTreeMap<String, f32>) -> String {
         .map(|(tag, value)| format!("{tag}{value}"))
         .collect();
     items.join(",")
+}
+
+/// The `{h}` of `sample-{h}.woff2`: the first 12 lowercase hex characters of the sha256 of the
+/// face's sample text as the index gives it (UTF-8, no normalisation, newlines kept).
+pub fn sample_hash(text: &str) -> String {
+    let mut h = craft_font_store::sha256_hex(text.as_bytes());
+    h.truncate(12);
+    h
 }
 
 /// The record of every face, with the static files precompute left in `generation`.
@@ -109,6 +121,7 @@ pub fn build(faces: &[Face], licences: &BTreeSet<String>, generation: &Path) -> 
                 instances: face.instances.clone(),
                 list,
                 sample,
+                sample_hash: face.sample_text.as_deref().map(sample_hash),
                 statics,
             },
         );
@@ -134,5 +147,17 @@ mod tests {
             "GRAD0,opsz14.5,slnt-10"
         );
         assert_eq!(instance_name(&coords(&[("wght", 0.1)])), "wght0.1");
+    }
+
+    #[test]
+    fn sample_hashes_match_the_shared_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/preview-vectors.json")).unwrap();
+        let cases = vectors["sample_hash"]["vectors"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let text = case["text"].as_str().unwrap();
+            assert_eq!(sample_hash(text), case["h"].as_str().unwrap(), "{text:?}");
+        }
     }
 }

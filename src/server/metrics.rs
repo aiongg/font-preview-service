@@ -20,6 +20,8 @@ pub struct Metrics {
     pub face_misses: AtomicU64,
     pub response_hits: AtomicU64,
     pub response_misses: AtomicU64,
+    pub files_br_hits: AtomicU64,
+    pub files_br_misses: AtomicU64,
     pub subset_failures: AtomicU64,
     pub generation_load_failures: AtomicU64,
     generation: Mutex<Option<(String, usize)>>,
@@ -132,6 +134,11 @@ impl Metrics {
             "fps_cache_hits_total{{cache=\"response\"}} {}",
             load(&self.response_hits)
         );
+        let _ = writeln!(
+            out,
+            "fps_cache_hits_total{{cache=\"files_br\"}} {}",
+            load(&self.files_br_hits)
+        );
         out.push_str("# TYPE fps_cache_misses_total counter\n");
         let _ = writeln!(
             out,
@@ -142,6 +149,11 @@ impl Metrics {
             out,
             "fps_cache_misses_total{{cache=\"response\"}} {}",
             load(&self.response_misses)
+        );
+        let _ = writeln!(
+            out,
+            "fps_cache_misses_total{{cache=\"files_br\"}} {}",
+            load(&self.files_br_misses)
         );
         out.push_str("# TYPE fps_cache_entries gauge\n");
         for (name, entries, _) in caches {
