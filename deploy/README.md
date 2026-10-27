@@ -39,6 +39,8 @@ None are stored here. The SSH destination and domain are arguments; Cloudflare's
    ORIGIN_PULL=require deploy/deploy.sh setup <ssh-dest> <domain> <image@sha256:…>
    ```
 
+For production, use Authenticated Origin Pulls with a per-zone certificate (the zone owner creates it and uploads it to Cloudflare; the origin trusts only that CA): Cloudflare's shared certificate proves only that a request came through Cloudflare, not through this zone.
+
 Until step 3, Caddy verifies the client certificate when Cloudflare sends one and accepts connections without one, so the service keeps working whichever order the steps happen in.
 
 ## Container contract (Flatcar now, Kubernetes later)
