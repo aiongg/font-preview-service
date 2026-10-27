@@ -27,7 +27,7 @@ deploy/deploy.sh ignition <domain> <image@sha256:…> host.ign     # Ignition co
 
 ## Host-specific values
 
-None are stored here. The SSH destination and domain are arguments; Cloudflare's ranges are fetched at each `setup`. Re-run `setup` when they change.
+None are stored here. The SSH destination and domain are arguments; Cloudflare's ranges are fetched at `setup` and refreshed daily on the host.
 
 ## Cloudflare settings (on the zone's account)
 
