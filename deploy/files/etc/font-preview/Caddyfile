@@ -1,0 +1,21 @@
+{
+	http_port 8080
+	https_port 8443
+	admin off
+	# Cloudflare may reach the origin over plain HTTP ("Flexible" mode); a redirect to HTTPS
+	# would loop. Clients reach HTTPS at Cloudflare either way.
+	auto_https disable_redirects
+	servers {
+		trusted_proxies static {$FPS_TRUSTED_PROXIES}
+		client_ip_headers CF-Connecting-IP X-Forwarded-For
+	}
+}
+
+{$FPS_DOMAIN}, http://{$FPS_DOMAIN} {
+	header -Server
+	reverse_proxy fps:8000
+	log {
+		output stdout
+		format json
+	}
+}

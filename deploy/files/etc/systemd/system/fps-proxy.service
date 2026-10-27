@@ -1,0 +1,31 @@
+[Unit]
+Description=Font preview service: TLS proxy (Caddy)
+After=docker.service network-online.target fps.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/font-preview/release.env
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+ExecStartPre=-/usr/bin/docker network create fps
+ExecStartPre=-/usr/bin/docker rm -f fps-proxy
+ExecStartPre=/usr/bin/docker pull ${CADDY_IMAGE}
+# Caddy listens on 8080/8443 inside the container so it runs as a normal user with no
+# capabilities; the host's 80/443 are published onto them.
+ExecStart=/usr/bin/docker run --rm --name fps-proxy --network fps \
+  --user 1000:1000 --read-only --tmpfs /tmp:size=16m \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --memory 200m --memory-swap 200m --cpus 0.5 --pids-limit 128 \
+  -p 80:8080 -p 443:8443 \
+  -v /var/lib/font-preview/caddy/data:/data \
+  -v /var/lib/font-preview/caddy/config:/config \
+  -v /etc/font-preview/Caddyfile:/etc/caddy/Caddyfile:ro \
+  --env-file /etc/font-preview/site.env \
+  --log-driver journald --log-opt tag=fps-proxy \
+  ${CADDY_IMAGE}
+ExecStop=/usr/bin/docker stop -t 10 fps-proxy
+
+[Install]
+WantedBy=multi-user.target
