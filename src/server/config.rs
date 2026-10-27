@@ -16,6 +16,8 @@ use std::path::PathBuf;
 /// | `FACE_CACHE_MB` | 256 | summed size of those font files |
 /// | `RESPONSE_CACHE_MB` | 256 | on-demand results |
 /// | `FILES_BR_CACHE_MB` | 64 | brotli-compressed file downloads |
+/// | `FILES_CONCURRENCY` | 64 | file downloads sent at once |
+/// | `FILES_QUEUE` | 16 × concurrency | downloads that may wait for a slot; beyond it, 503 |
 /// | `CLIENT_IP_HEADER` | unset | header with the client address, set by the proxy in front |
 ///
 /// Without `CLIENT_IP_HEADER` the client is the peer address. With it, the server takes the
@@ -36,6 +38,8 @@ pub struct Config {
     pub face_cache_bytes: u64,
     pub response_cache_bytes: u64,
     pub files_br_cache_bytes: u64,
+    pub files_concurrency: usize,
+    pub files_queue: usize,
     pub client_ip_header: Option<HeaderName>,
 }
 
@@ -55,6 +59,8 @@ impl Config {
             face_cache_bytes: 256 << 20,
             response_cache_bytes: 256 << 20,
             files_br_cache_bytes: 64 << 20,
+            files_concurrency: 64,
+            files_queue: 16 * 64,
             client_ip_header: None,
         }
     }
@@ -108,6 +114,13 @@ impl Config {
         if let Some(b) = mb("FILES_BR_CACHE_MB")? {
             cfg.files_br_cache_bytes = b;
         }
+        if let Some(n) = parse("FILES_CONCURRENCY", get("FILES_CONCURRENCY"))? {
+            cfg.files_concurrency = n;
+            cfg.files_queue = 16 * n;
+        }
+        if let Some(q) = parse("FILES_QUEUE", get("FILES_QUEUE"))? {
+            cfg.files_queue = q;
+        }
         if let Some(h) = get("CLIENT_IP_HEADER") {
             cfg.client_ip_header = Some(
                 HeaderName::try_from(h.as_str())
@@ -123,6 +136,9 @@ impl Config {
         }
         if cfg.concurrency == 0 {
             return Err("ONDEMAND_CONCURRENCY must be above 0".into());
+        }
+        if cfg.files_concurrency == 0 {
+            return Err("FILES_CONCURRENCY must be above 0".into());
         }
         Ok(cfg)
     }
@@ -171,18 +187,21 @@ mod tests {
         let cfg = Config::from_lookup(env(&[
             ("FONTS_DIR", "/fonts"),
             ("ONDEMAND_CONCURRENCY", "3"),
+            ("FILES_CONCURRENCY", "8"),
             ("RESPONSE_CACHE_MB", "8"),
             ("FACE_CACHE_MB", "32"),
             ("CLIENT_IP_HEADER", "CF-Connecting-IP"),
         ]))
         .unwrap();
         assert_eq!((cfg.concurrency, cfg.queue), (3, 12));
+        assert_eq!((cfg.files_concurrency, cfg.files_queue), (8, 128));
         assert_eq!(cfg.response_cache_bytes, 8 << 20);
         assert_eq!(cfg.face_cache_bytes, 32 << 20);
         assert_eq!(cfg.files_br_cache_bytes, 64 << 20);
         assert_eq!(cfg.client_ip_header.unwrap().as_str(), "cf-connecting-ip");
         for (key, bad) in [
             ("ONDEMAND_CONCURRENCY", "0"),
+            ("FILES_CONCURRENCY", "0"),
             ("ONDEMAND_RATE", "-1"),
             ("FACE_CACHE", "many"),
             ("CLIENT_IP_HEADER", "bad header"),

@@ -62,6 +62,47 @@ impl Cached {
     }
 }
 
+type BrJob = Box<dyn FnOnce() + Send>;
+
+/// The one long-lived thread that brotli-compresses `/v1/files` downloads. A compression holds
+/// the whole file, its output and the encoder's tables. On the blocking pool each one could run
+/// on another thread, and glibc kept every thread's malloc arena at that peak: anonymous memory
+/// grew past 600 MiB within 15 s of 1,000 concurrent downloads. One thread keeps one arena.
+struct BrThread(std::sync::mpsc::Sender<BrJob>);
+
+impl BrThread {
+    fn spawn() -> Self {
+        let (jobs, rx) = std::sync::mpsc::channel::<BrJob>();
+        let spawned = std::thread::Builder::new()
+            .name("files-br".into())
+            .spawn(move || {
+                for job in rx {
+                    // A panic drops the job's reply; that download goes out uncompressed.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("no compression thread, file downloads go out uncompressed: {e}");
+        }
+        Self(jobs)
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> std::io::Result<T> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.0
+            .send(Box::new(move || {
+                let _ = reply.send(job());
+            }))
+            .map_err(|_| std::io::Error::other("no compression thread"))?;
+        result
+            .await
+            .map_err(|_| std::io::Error::other("compression panicked"))
+    }
+}
+
 pub struct App {
     config: Config,
     store: Store,
@@ -72,11 +113,15 @@ pub struct App {
     /// Font files for the subsetter.
     faces: Lru<Bytes>,
     responses: Lru<Arc<Cached>>,
-    /// Brotli-compressed `/v1/files` downloads, and the one slot that compresses them.
+    /// Brotli-compressed `/v1/files` downloads, the one slot that compresses them, and the
+    /// thread that does.
     files_br: Lru<Arc<Cached>>,
     br_slot: Arc<Semaphore>,
+    br_thread: BrThread,
     limiter: RateLimiter,
     gate: Gate,
+    /// `/v1/files` downloads in flight.
+    downloads: Gate,
     metrics: Metrics,
     stopping: AtomicBool,
 }
@@ -92,8 +137,10 @@ impl App {
             responses: Lru::new(usize::MAX, config.response_cache_bytes),
             files_br: Lru::new(usize::MAX, config.files_br_cache_bytes),
             br_slot: Arc::new(Semaphore::new(1)),
+            br_thread: BrThread::spawn(),
             limiter: RateLimiter::new(config.rate_per_s, config.burst),
             gate: Gate::new(config.concurrency, config.queue),
+            downloads: Gate::new(config.files_concurrency, config.files_queue),
             metrics: Metrics::default(),
             stopping: AtomicBool::new(false),
             config,

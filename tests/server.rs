@@ -394,6 +394,37 @@ async fn readiness_follows_the_loaded_generation() {
 }
 
 #[tokio::test]
+async fn downloads_keep_their_slot_until_the_body_is_gone() {
+    let mut cfg = Config::new(volume());
+    cfg.files_concurrency = 1;
+    cfg.files_queue = 4;
+    let app = app_with(cfg);
+    let url = format!("/v1/files/{}", sha(ABEEZEE));
+    let request = || Request::builder().uri(&url).body(Body::empty()).unwrap();
+    let mut sending = Vec::new();
+    // One sending, four waiting: the fifth and sixth requests find the queue full.
+    for _ in 0..5 {
+        let app = app.clone();
+        let req = request();
+        sending.push(tokio::spawn(async move { app.router().oneshot(req).await }));
+    }
+    let first = sending.remove(0).await.unwrap().unwrap();
+    assert_eq!(first.status(), 200);
+    let (status, headers, _) = get(&app, &url, &[]).await;
+    assert_eq!(status, 503, "one download and four waiting fill the slots");
+    assert_eq!(headers["retry-after"], "1");
+    drop(first);
+    for waiting in sending {
+        let response = waiting.await.unwrap().unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], ABEEZEE);
+    }
+}
+
+#[tokio::test]
 async fn compression_spends_on_demand_tokens() {
     let mut cfg = Config::new(volume());
     cfg.burst = 1.0;

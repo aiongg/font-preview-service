@@ -358,6 +358,7 @@ dependencies = [
  "craft-font-store",
  "flate2",
  "harfbuzz-subset-sys",
+ "http-body",
  "hyper-util",
  "lru",
  "rustybuzz",

@@ -2,12 +2,12 @@
 
 use super::generation::{Face, Generation};
 use super::metrics::inc;
-use super::{App, Cached};
+use super::{App, Cached, Permit};
 use crate::precompute::{self, ASCII, SAMPLE, VAR, static_path};
 use crate::store::Kind;
 use crate::subset::{self, Instance, Quality, closure, codepoints};
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{ConnectInfo, MatchedPath, Path, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -15,11 +15,14 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use craft_font_store::sha256_hex;
+use http_body::{Frame, SizeHint};
 use skrifa::{FontRef, MetadataProvider};
 use std::collections::BTreeSet;
 use std::io::SeekFrom;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
@@ -91,6 +94,13 @@ fn error(status: StatusCode, message: &'static str) -> Response {
 
 fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not found\n")
+}
+
+fn busy() -> Response {
+    let mut r = error(StatusCode::SERVICE_UNAVAILABLE, "busy\n");
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    r
 }
 
 fn not_ready() -> Response {
@@ -373,10 +383,7 @@ async fn on_demand(app: Arc<App>, generation: Arc<Generation>, job: Job, req: Pa
     }
     inc(&app.metrics.response_misses);
     let Some(permit) = app.gate.acquire().await else {
-        let mut r = error(StatusCode::SERVICE_UNAVAILABLE, "busy\n");
-        r.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        return r;
+        return busy();
     };
     let started = Instant::now();
     let worker = app.clone();
@@ -491,13 +498,52 @@ async fn file(State(app): AppState, Path(sha): Path<String>, req: Parts) -> Resp
     let Some(generation) = app.generation() else {
         return not_ready();
     };
-    let Some(face) = generation.faces.get(&sha) else {
+    let Some(size) = generation.faces.get(&sha).map(|face| face.size) else {
         return not_found();
     };
+    let Some(permit) = app.downloads.acquire().await else {
+        return busy();
+    };
+    send_file(&app, &sha, size, &req).await.map(|body| {
+        Body::new(Held {
+            body,
+            _permit: permit,
+        })
+    })
+}
+
+/// A response body that keeps its download slot until it is sent or dropped. Each download in
+/// flight holds up to a read chunk plus hyper's write buffer, so the slots bound their memory.
+struct Held {
+    body: Body,
+    _permit: Permit,
+}
+
+impl HttpBody for Held {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+async fn send_file(app: &Arc<App>, sha: &str, size: u64, req: &Parts) -> Response {
     let headers = &req.headers;
     if accepts_br(headers)
-        && face.size <= MAX_BR_FILE
-        && let Some(response) = compressed_file(&app, &sha, &req).await
+        && size <= MAX_BR_FILE
+        && let Some(response) = compressed_file(app, sha, req).await
     {
         return response;
     }
@@ -505,7 +551,7 @@ async fn file(State(app): AppState, Path(sha): Path<String>, req: Parts) -> Resp
     if matches(headers, &etag) {
         return immutable(headers, Bytes::new(), &etag, "", &[VARY]);
     }
-    match open_file(&app, &sha).await {
+    match open_file(app, sha).await {
         Ok((file, len, content_type)) => {
             let body = Body::from_stream(ReaderStream::with_capacity(file, STREAM_CHUNK));
             let mut response = immutable(headers, body, &etag, content_type, &[VARY]);
@@ -557,21 +603,22 @@ async fn compressed_file(app: &Arc<App>, sha: &str, req: &Parts) -> Option<Respo
         .ok()?;
     inc(&app.metrics.files_br_misses);
     let path = app.store.path(Kind::File, sha);
-    let compressed = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let bytes = std::fs::read(path)?;
-        let mut out = Vec::new();
-        let params = brotli::enc::BrotliEncoderParams {
-            quality: 5,
-            size_hint: bytes.len(),
-            ..Default::default()
-        };
-        brotli::BrotliCompress(&mut &bytes[..], &mut out, &params)?;
-        Ok::<_, std::io::Error>((font_type(&bytes), out))
-    })
-    .await
-    .map_err(std::io::Error::other)
-    .and_then(|r| r);
+    let compressed = app
+        .br_thread
+        .run(move || {
+            let _permit = permit;
+            let bytes = std::fs::read(path)?;
+            let mut out = Vec::new();
+            let params = brotli::enc::BrotliEncoderParams {
+                quality: 5,
+                size_hint: bytes.len(),
+                ..Default::default()
+            };
+            brotli::BrotliCompress(&mut &bytes[..], &mut out, &params)?;
+            Ok::<_, std::io::Error>((font_type(&bytes), out))
+        })
+        .await
+        .and_then(|r| r);
     let (content_type, out) = match compressed {
         Ok(done) => done,
         Err(e) => {
