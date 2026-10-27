@@ -219,3 +219,36 @@ fn sync_reports_a_file_no_mirror_has() {
     assert_eq!(m.failures[0].family, "BBH Bartle");
     assert_eq!(m.totals.fetched, 2);
 }
+
+#[test]
+fn a_failed_run_keeps_the_last_good_manifest() {
+    let fx = fixture();
+    let port = serve(fx.server.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), &fx.sources_sha256);
+    run(&cfg, &Local(port), &|_| {}).unwrap();
+    let store = Store::new(dir.path());
+    let good = std::fs::read(store.manifest_path()).unwrap();
+
+    let mut broken = fixture();
+    Arc::get_mut(&mut broken.server)
+        .unwrap()
+        .files
+        .remove("ofl/bbhbartle/BBHBartle-Regular.ttf");
+    let port = serve(broken.server.clone());
+    // A fresh store, so the missing file is not already present.
+    let dir2 = tempfile::tempdir().unwrap();
+    let store2 = Store::new(dir2.path());
+    std::fs::write(store2.manifest_path(), &good).unwrap();
+    let m = run(
+        &config(dir2.path(), &broken.sources_sha256),
+        &Local(port),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(m.totals.failed, 1);
+    assert_eq!(std::fs::read(store2.manifest_path()).unwrap(), good);
+    let failed: Value =
+        serde_json::from_slice(&std::fs::read(store2.failed_manifest_path()).unwrap()).unwrap();
+    assert_eq!(failed["totals"]["failed"], 1);
+}

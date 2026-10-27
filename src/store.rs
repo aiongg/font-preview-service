@@ -3,7 +3,8 @@
 //! ```text
 //! <root>/files/<first 2 hex of sha256>/<sha256>      upstream font files
 //! <root>/licences/<first 2 hex of sha256>/<sha256>   licence texts
-//! <root>/manifest.json
+//! <root>/manifest.json                               last fully successful sync
+//! <root>/manifest.failed.json                        report of the last sync with failures
 //! ```
 
 use craft_font_store::sha256_hex;
@@ -42,6 +43,31 @@ impl Store {
 
     pub fn manifest_path(&self) -> PathBuf {
         self.root.join("manifest.json")
+    }
+
+    pub fn failed_manifest_path(&self) -> PathBuf {
+        self.root.join("manifest.failed.json")
+    }
+
+    /// Deletes `.*.tmp` files that interrupted `put` calls left in the blob directories.
+    pub fn remove_stale_tmp(&self) {
+        for kind in [Kind::File, Kind::Licence] {
+            let Ok(subdirs) = fs::read_dir(self.root.join(kind.dir())) else {
+                continue;
+            };
+            for sub in subdirs.flatten() {
+                let Ok(entries) = fs::read_dir(sub.path()) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with('.') && name.ends_with(".tmp") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
     }
 
     /// Where the blob with this sha256 lives. `sha256` must be 64 lowercase hex digits.

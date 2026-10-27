@@ -3,10 +3,10 @@
 
 use crate::store::{Kind, Store};
 use craft_font_store::{
-    Cancel, Client, FontFile, Index, SourceEntry, SourcesFile, sha256_hex, verify_font,
+    Cancel, Client, FontFile, Index, IndexPin, SourceEntry, SourcesFile, sha256_hex, verify_font,
 };
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,15 +104,14 @@ impl Config {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
 
-    /// Base URLs of the index repository at the pinned commit, best first.
-    fn bases(&self) -> [String; 2] {
-        [
-            format!("https://cdn.jsdelivr.net/gh/{}@{}/", self.repo, self.commit),
-            format!(
-                "https://raw.githubusercontent.com/{}/{}/",
-                self.repo, self.commit
-            ),
-        ]
+    /// The pinned index repository, for building (percent-encoded) download URLs. The strings are
+    /// leaked because `IndexPin` holds `&'static str`; a process builds one per run.
+    fn pin(&self) -> IndexPin {
+        IndexPin {
+            repo: Box::leak(self.repo.clone().into_boxed_str()),
+            commit: Box::leak(self.commit.clone().into_boxed_str()),
+            sha256: Box::leak(self.sources_sha256.clone().into_boxed_str()),
+        }
     }
 }
 
@@ -122,6 +121,8 @@ pub struct SourceReport {
     pub families: usize,
     pub files: usize,
     pub licences: usize,
+    /// Families with a licence path but no hashed `license_file`; their licence is not mirrored.
+    pub licences_unhashed: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,13 +167,8 @@ fn fetch_first<T>(
     Err(last)
 }
 
-fn urls_for(bases: &[String], path: &str) -> Vec<String> {
-    bases.iter().map(|b| format!("{b}{path}")).collect()
-}
-
-fn read_sources(cfg: &Config, fetch: &dyn Fetch) -> Result<SourcesFile, String> {
-    let urls = urls_for(&cfg.bases(), "sources.json");
-    fetch_first(fetch, &urls, MAX_SOURCES_BYTES, &|bytes| {
+fn read_sources(cfg: &Config, pin: &IndexPin, fetch: &dyn Fetch) -> Result<SourcesFile, String> {
+    fetch_first(fetch, &pin.urls(), MAX_SOURCES_BYTES, &|bytes| {
         if sha256_hex(bytes) != cfg.sources_sha256 {
             return Err("sources.json does not match INDEX_SHA256".into());
         }
@@ -180,14 +176,21 @@ fn read_sources(cfg: &Config, fetch: &dyn Fetch) -> Result<SourcesFile, String> 
     })
 }
 
-fn read_index(entry: &SourceEntry, bases: &[String], fetch: &dyn Fetch) -> Result<Index, String> {
-    let (path, gz) = match entry.gz() {
-        Some((path, _, _)) => (path, true),
-        None => (entry.path.as_str(), false),
+/// Reads an index, preferring its gzip form and falling back to the plain file when no mirror
+/// serves a usable gzip.
+fn read_index(entry: &SourceEntry, pin: &IndexPin, fetch: &dyn Fetch) -> Result<Index, String> {
+    let attempt = |path: &str, gz: bool| {
+        fetch_first(fetch, &pin.file_urls(path), MAX_INDEX_BYTES, &|bytes| {
+            entry.read(bytes, gz).map_err(|e| e.to_string())
+        })
     };
-    fetch_first(fetch, &urls_for(bases, path), MAX_INDEX_BYTES, &|bytes| {
-        entry.read(bytes, gz).map_err(|e| e.to_string())
-    })
+    match entry.gz() {
+        Some((gz_path, _, _)) => attempt(gz_path, true).or_else(|gz_err| {
+            attempt(&entry.path, false)
+                .map_err(|plain_err| format!("{gz_err}; plain fallback: {plain_err}"))
+        }),
+        None => attempt(&entry.path, false),
+    }
 }
 
 struct Job {
@@ -200,49 +203,61 @@ struct Job {
     font: Option<FontFile>,
 }
 
-/// One job per distinct blob of the index; `seen` spans all sources so shared blobs are fetched once.
+/// Adds one job per distinct blob of the index; `seen` spans all sources so shared blobs are fetched
+/// once. A blob already seen from another source gains this source's URLs as extra mirrors.
 fn collect_jobs(
     source: &str,
     index: &Index,
-    seen: &mut HashSet<(Kind, String)>,
-) -> (SourceReport, Vec<Job>) {
+    seen: &mut HashMap<(Kind, String), usize>,
+    jobs: &mut Vec<Job>,
+) -> SourceReport {
     let mut report = SourceReport {
         source: source.to_string(),
         ..SourceReport::default()
     };
-    let mut jobs = Vec::new();
+    let mut add = |job: Job| match seen.get(&(job.kind, job.sha256.clone())) {
+        Some(&i) => {
+            for url in job.urls {
+                if !jobs[i].urls.contains(&url) {
+                    jobs[i].urls.push(url);
+                }
+            }
+        }
+        None => {
+            seen.insert((job.kind, job.sha256.clone()), jobs.len());
+            jobs.push(job);
+        }
+    };
     for family in index.families() {
         report.families += 1;
         for file in &family.files {
             report.files += 1;
-            if seen.insert((Kind::File, file.sha256.clone())) {
-                jobs.push(Job {
-                    family: family.family.clone(),
-                    label: file.path.clone(),
-                    kind: Kind::File,
-                    sha256: file.sha256.clone(),
-                    size: file.size,
-                    urls: index.file_urls(family, file),
-                    font: Some(file.clone()),
-                });
-            }
+            add(Job {
+                family: family.family.clone(),
+                label: file.path.clone(),
+                kind: Kind::File,
+                sha256: file.sha256.clone(),
+                size: file.size,
+                urls: index.file_urls(family, file),
+                font: Some(file.clone()),
+            });
         }
         if let Some(lic) = &family.license_file {
             report.licences += 1;
-            if seen.insert((Kind::Licence, lic.sha256.clone())) {
-                jobs.push(Job {
-                    family: family.family.clone(),
-                    label: lic.path.clone(),
-                    kind: Kind::Licence,
-                    sha256: lic.sha256.clone(),
-                    size: lic.size,
-                    urls: index.license_urls(family),
-                    font: None,
-                });
-            }
+            add(Job {
+                family: family.family.clone(),
+                label: lic.path.clone(),
+                kind: Kind::Licence,
+                sha256: lic.sha256.clone(),
+                size: lic.size,
+                urls: index.license_urls(family),
+                font: None,
+            });
+        } else if family.license_path.is_some() {
+            report.licences_unhashed += 1;
         }
     }
-    (report, jobs)
+    report
 }
 
 enum Outcome {
@@ -339,24 +354,26 @@ pub fn run(
     log: &(dyn Fn(&str) + Sync),
 ) -> Result<Manifest, String> {
     let store = Store::new(&cfg.fonts_dir);
-    let sources = read_sources(cfg, fetch).map_err(|e| format!("reading sources.json: {e}"))?;
+    let _lock = lock(&store)?;
+    store.remove_stale_tmp();
+    let pin = cfg.pin();
+    let sources =
+        read_sources(cfg, &pin, fetch).map_err(|e| format!("reading sources.json: {e}"))?;
     log(&format!(
         "sources.json lists {} indexes",
         sources.indexes.len()
     ));
-    let bases = cfg.bases();
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let (mut reports, mut jobs, mut failures) = (Vec::new(), Vec::new(), Vec::new());
     for entry in &sources.indexes {
-        match read_index(entry, &bases, fetch) {
+        match read_index(entry, &pin, fetch) {
             Ok(index) => {
-                let (report, found) = collect_jobs(&entry.source, &index, &mut seen);
+                let report = collect_jobs(&entry.source, &index, &mut seen, &mut jobs);
                 log(&format!(
                     "{}: {} families, {} files",
                     entry.source, report.families, report.files
                 ));
                 reports.push(report);
-                jobs.extend(found);
             }
             Err(reason) => {
                 log(&format!("FAILED index {}: {reason}", entry.source));
@@ -390,15 +407,44 @@ pub fn run(
     Ok(manifest)
 }
 
-fn write_manifest(store: &Store, manifest: &Manifest) -> Result<(), String> {
-    let json = serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?;
+/// Takes an exclusive lock on `FONTS_DIR/.sync.lock`, held until the returned file is dropped.
+fn lock(store: &Store) -> Result<std::fs::File, String> {
     std::fs::create_dir_all(store.root())
         .map_err(|e| format!("creating {}: {e}", store.root().display()))?;
-    let path = store.manifest_path();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)
-        .and_then(|()| std::fs::rename(&tmp, &path))
-        .map_err(|e| format!("writing {}: {e}", path.display()))
+    let path = store.root().join(".sync.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err("another sync is running".into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("locking {}: {e}", path.display())),
+    }
+}
+
+/// A clean run replaces `manifest.json`. A run with failures writes `manifest.failed.json` and
+/// leaves the last good manifest in place.
+fn write_manifest(store: &Store, manifest: &Manifest) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?;
+    let path = if manifest.failures.is_empty() {
+        store.manifest_path()
+    } else {
+        store.failed_manifest_path()
+    };
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &json)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("writing {}: {e}", path.display())
+    })
 }
 
 /// The `sync` subcommand. Returns the process exit code.
@@ -453,12 +499,15 @@ mod tests {
         let cfg = lookup(&good()).unwrap();
         assert_eq!(cfg.repo, DEFAULT_INDEX_REPO);
         assert_eq!(
-            cfg.bases()[0],
-            format!("https://cdn.jsdelivr.net/gh/aiongg/craft-font-index@{COMMIT}/")
-        );
-        assert_eq!(
-            cfg.bases()[1],
-            format!("https://raw.githubusercontent.com/aiongg/craft-font-index/{COMMIT}/")
+            cfg.pin().file_urls("ofl/a b/X.ttf"),
+            [
+                format!(
+                    "https://cdn.jsdelivr.net/gh/aiongg/craft-font-index@{COMMIT}/ofl/a%20b/X.ttf"
+                ),
+                format!(
+                    "https://raw.githubusercontent.com/aiongg/craft-font-index/{COMMIT}/ofl/a%20b/X.ttf"
+                ),
+            ]
         );
     }
 
