@@ -49,12 +49,81 @@ impl Fetch for HttpFetch {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub fonts_dir: PathBuf,
     pub repo: String,
     pub commit: String,
     pub sources_sha256: String,
+    pub tuning: Tuning,
+}
+
+/// How the precompute step runs, from the `SYNC_*` variables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tuning {
+    /// `SYNC_THREADS`; default the available parallelism, at most 4.
+    pub threads: usize,
+    /// `SYNC_MEMORY_MB`, default 512: the summed size of font files precomputed at once.
+    pub memory_bytes: u64,
+    /// `SYNC_MAX_FAILED_PERCENT`, default 1: above this share of faces with a failed subset, the
+    /// run keeps `current` and fails.
+    pub max_failed_percent: f64,
+    /// `SYNC_FORCE=1`: build a generation even when nothing changed.
+    pub force: bool,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            threads: std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(4),
+            memory_bytes: 512 << 20,
+            max_failed_percent: 1.0,
+            force: false,
+        }
+    }
+}
+
+impl Tuning {
+    fn from_lookup(get: &impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        fn parse<T: std::str::FromStr>(
+            get: &impl Fn(&str) -> Option<String>,
+            key: &str,
+        ) -> Result<Option<T>, String> {
+            match get(key).filter(|v| !v.is_empty()) {
+                None => Ok(None),
+                Some(v) => v
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| format!("{key} `{v}` is not a valid value")),
+            }
+        }
+        let default = Self::default();
+        let threads = parse::<usize>(get, "SYNC_THREADS")?.unwrap_or(default.threads);
+        let memory_mb = parse::<u64>(get, "SYNC_MEMORY_MB")?;
+        let max_failed_percent =
+            parse::<f64>(get, "SYNC_MAX_FAILED_PERCENT")?.unwrap_or(default.max_failed_percent);
+        if threads == 0 || memory_mb == Some(0) {
+            return Err("SYNC_THREADS and SYNC_MEMORY_MB must be above 0".into());
+        }
+        if !(0.0..=100.0).contains(&max_failed_percent) {
+            return Err("SYNC_MAX_FAILED_PERCENT must be between 0 and 100".into());
+        }
+        Ok(Self {
+            threads,
+            memory_bytes: memory_mb.map_or(default.memory_bytes, |mb| mb << 20),
+            max_failed_percent,
+            force: get("SYNC_FORCE").as_deref() == Some("1"),
+        })
+    }
+
+    fn limits(&self) -> precompute::Limits {
+        precompute::Limits {
+            threads: self.threads,
+            memory_bytes: self.memory_bytes,
+        }
+    }
 }
 
 fn is_hex(s: &str, len: usize) -> bool {
@@ -74,7 +143,8 @@ fn is_repo(s: &str) -> bool {
 }
 
 impl Config {
-    /// Reads `FONTS_DIR`, `INDEX_REPO`, `INDEX_COMMIT` and `INDEX_SHA256` through `get`.
+    /// Reads `FONTS_DIR`, `INDEX_REPO`, `INDEX_COMMIT`, `INDEX_SHA256` and the `SYNC_*` tuning
+    /// through `get`.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let need = |key: &str| {
             get(key)
@@ -96,11 +166,13 @@ impl Config {
         if !is_hex(&sources_sha256, 64) {
             return Err("INDEX_SHA256 must be 64 lowercase hex digits".into());
         }
+        let tuning = Tuning::from_lookup(&get)?;
         Ok(Self {
             fonts_dir,
             repo,
             commit,
             sources_sha256,
+            tuning,
         })
     }
 
@@ -156,6 +228,19 @@ pub struct Manifest {
     pub generation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precompute: Option<precompute::Report>,
+    /// Why a generation was built but `current` not switched to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused_switch: Option<String>,
+    /// Nothing changed since the generation `current` points to, which stays.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
+}
+
+impl Manifest {
+    /// Whether `current` now holds this run's index: the exit status of `sync`.
+    pub fn succeeded(&self) -> bool {
+        self.failures.is_empty() && self.refused_switch.is_none()
+    }
 }
 
 /// Tries each URL in turn and returns the first body `accept` takes. A refusal (403 from jsDelivr
@@ -428,61 +513,123 @@ pub fn run(
         failures,
         generation: None,
         precompute: None,
+        refused_switch: None,
+        unchanged: false,
     };
     log(&format!(
         "fetch: {} fetched, {} already present, {} failed",
         manifest.totals.fetched, manifest.totals.skipped, manifest.totals.failed
     ));
-    if manifest.failures.is_empty() {
-        build_generation(&store, &faces, &mut manifest, log)?;
-    } else {
+    if !manifest.failures.is_empty() {
         write_manifest(&store.failed_manifest_path(), &manifest)?;
         log("fetch failures: no new generation; `current` is unchanged");
+    } else if !cfg.tuning.force
+        && let Some(name) = unchanged_generation(&store, &manifest)
+    {
+        log(&format!("unchanged: current -> {name} stays"));
+        manifest.generation = Some(name);
+        manifest.unchanged = true;
+    } else {
+        build_generation(&store, &faces, &mut manifest, &cfg.tuning, log)?;
     }
     Ok(manifest)
 }
 
-/// Precomputes the static subsets into a new generation, writes its manifest last, switches
-/// `current` to it and removes generations older than the one it replaced.
-fn build_generation(
-    store: &Store,
-    faces: &[Face],
-    manifest: &mut Manifest,
-    log: &(dyn Fn(&str) + Sync),
-) -> Result<(), String> {
-    let (name, dir) = store
-        .new_generation(&manifest.index_commit)
-        .map_err(|e| format!("creating a generation in {}: {e}", store.root().display()))?;
-    let report = precompute::run(faces, store, &dir);
+/// The generation `current` points to, when it exists, holds this index commit and sources, and
+/// this run fetched nothing new.
+fn unchanged_generation(store: &Store, manifest: &Manifest) -> Option<String> {
+    if manifest.totals.fetched != 0 {
+        return None;
+    }
+    let name = store.current_generation()?;
+    if !store.generation_dir(&name).is_dir() {
+        return None;
+    }
+    let bytes = std::fs::read(store.current_manifest_path()).ok()?;
+    let current: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    (current["index_commit"] == manifest.index_commit.as_str()
+        && current["sources_sha256"] == manifest.sources_sha256.as_str())
+    .then_some(name)
+}
+
+fn log_report(report: &precompute::Report, log: &(dyn Fn(&str) + Sync)) {
     for f in &report.failures {
         log(&format!(
             "FAILED subset {} / {} {}: {}",
             f.family, f.sha256, f.inst, f.reason
         ));
     }
+    for w in &report.warnings {
+        log(&format!(
+            "WARNING {} / {}: {}",
+            w.family, w.sha256, w.reason
+        ));
+    }
     log(&format!(
-        "precompute: {} faces, {} sample, {} ascii, {} var written, {} failed",
+        "precompute: {} faces, {} sample, {} ascii, {} var written, {} faces failed",
         report.faces,
         report.written.sample,
         report.written.ascii,
         report.written.var,
-        report.failures.len()
+        report.failed_faces()
     ));
-    manifest.generation = Some(name.clone());
+}
+
+/// Why precompute failed too often to switch to its generation, if it did.
+fn too_many_failures(report: &precompute::Report, max_percent: f64) -> Option<String> {
+    let failed = report.failed_faces();
+    let allowed = max_percent / 100.0 * report.faces as f64;
+    (failed as f64 > allowed).then(|| {
+        format!(
+            "{failed} of {} faces failed precompute, more than {max_percent}%",
+            report.faces
+        )
+    })
+}
+
+/// Precomputes the static subsets into a new generation, writes its manifest last, syncs it to
+/// disk, switches `current` to it and removes old generations. With too many failed faces, it
+/// removes the new generation instead and reports in `manifest.failed.json`.
+fn build_generation(
+    store: &Store,
+    faces: &[Face],
+    manifest: &mut Manifest,
+    tuning: &Tuning,
+    log: &(dyn Fn(&str) + Sync),
+) -> Result<(), String> {
+    let (name, dir) = store
+        .new_generation(&manifest.index_commit)
+        .map_err(|e| format!("creating a generation in {}: {e}", store.root().display()))?;
+    let report = precompute::run(faces, store, &dir, tuning.limits());
+    log_report(&report, log);
+    let refused = too_many_failures(&report, tuning.max_failed_percent);
     manifest.precompute = Some(report);
+    if let Some(reason) = refused {
+        log(&format!("{reason}: `current` is unchanged"));
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            log(&format!("WARNING removing {}: {e}", dir.display()));
+        }
+        manifest.refused_switch = Some(reason);
+        return write_manifest(&store.failed_manifest_path(), manifest);
+    }
+    manifest.generation = Some(name.clone());
     write_manifest(&dir.join(MANIFEST), manifest)?;
-    let previous = store.current_generation();
+    store
+        .sync_tree(&dir)
+        .map_err(|e| format!("syncing {}: {e}", dir.display()))?;
     store
         .switch_current(&name)
         .map_err(|e| format!("switching current to {name}: {e}"))?;
-    let mut keep = vec![name.as_str()];
-    keep.extend(previous.as_deref());
-    store
-        .prune_generations(&keep)
-        .map_err(|e| format!("removing old generations: {e}"))?;
     log(&format!("current -> {name}"));
+    for warning in store.after_switch(&name, KEPT_GENERATIONS) {
+        log(&format!("WARNING {warning}"));
+    }
     Ok(())
 }
+
+/// Generations kept besides the new one: servers may still read the previous one until they
+/// reload, and the one before stays for rolling back by hand.
+const KEPT_GENERATIONS: usize = 2;
 
 /// Takes an exclusive lock on `FONTS_DIR/.sync.lock`, held until the returned file is dropped.
 fn lock(store: &Store) -> Result<std::fs::File, String> {
@@ -528,7 +675,7 @@ pub fn main() -> i32 {
         }
     };
     match run(&cfg, &HttpFetch::new(), &|line| println!("{line}")) {
-        Ok(m) if m.failures.is_empty() => 0,
+        Ok(m) if m.succeeded() => 0,
         Ok(_) => 1,
         Err(e) => {
             eprintln!("sync: {e}");
@@ -599,6 +746,9 @@ mod tests {
             ("INDEX_SHA256", "abc"),
             ("INDEX_REPO", "no-slash"),
             ("INDEX_REPO", "a/../b"),
+            ("SYNC_THREADS", "0"),
+            ("SYNC_MEMORY_MB", "lots"),
+            ("SYNC_MAX_FAILED_PERCENT", "101"),
         ] {
             let mut pairs = without(key);
             pairs.push((key, bad.to_string()));

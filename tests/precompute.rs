@@ -100,13 +100,10 @@ fn a_clean_sync_precomputes_every_face_and_reports_failures() {
     let fx = faces();
     let port = serve(fx.server.clone());
     let dir = tempfile::tempdir().unwrap();
-    let m = run(
-        &config(dir.path(), &fx.sources_sha256),
-        &Local(port),
-        &|_| {},
-    )
-    .unwrap();
-    assert!(m.failures.is_empty(), "{:?}", m.failures);
+    let mut cfg = config(dir.path(), &fx.sources_sha256);
+    cfg.tuning.max_failed_percent = 100.0;
+    let m = run(&cfg, &Local(port), &|_| {}).unwrap();
+    assert!(m.succeeded(), "{:?}", m.failures);
     let store = Store::new(dir.path());
     let generation = format!("gen-{COMMIT}-1");
     assert_eq!(m.generation.as_deref(), Some(generation.as_str()));
@@ -152,9 +149,8 @@ fn a_clean_sync_precomputes_every_face_and_reports_failures() {
     assert_eq!(notdefs(&ttf, THAI), 0);
 }
 
-#[test]
-fn each_sync_builds_a_generation_and_keeps_only_the_previous_one() {
-    let fx = fixture_from(
+fn abeezee_only() -> common::Fixture {
+    fixture_from(
         json!([family(
             "ABeeZee",
             "OFL",
@@ -163,20 +159,77 @@ fn each_sync_builds_a_generation_and_keeps_only_the_previous_one() {
         )]),
         vec![("ofl/abeezee/ABeeZee-Regular.ttf", ABEEZEE.to_vec())],
         samples(),
-    );
+    )
+}
+
+#[test]
+fn forced_syncs_keep_the_new_generation_and_the_two_before() {
+    let fx = abeezee_only();
     let port = serve(fx.server.clone());
     let dir = tempfile::tempdir().unwrap();
-    let cfg = config(dir.path(), &fx.sources_sha256);
+    let mut cfg = config(dir.path(), &fx.sources_sha256);
+    cfg.tuning.force = true;
     let store = Store::new(dir.path());
     let generation = |n: u32| format!("gen-{COMMIT}-{n}");
     let present = |n| store.generation_dir(&generation(n)).exists();
+    // A failure report and a root manifest from an older layout go once a switch succeeds.
+    std::fs::write(store.failed_manifest_path(), b"{}").unwrap();
+    std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
 
-    for n in 1..=3 {
+    for n in 1..=4 {
         let m = run(&cfg, &Local(port), &|_| {}).unwrap();
         assert_eq!(m.generation, Some(generation(n)));
         assert_eq!(store.current_generation(), Some(generation(n)));
         assert!(static_path(&store.current_link(), &sha256_hex(ABEEZEE), "sample").exists());
+        assert!((1..=n).all(|k| present(k) == (k + 2 >= n)), "after run {n}");
     }
-    assert!(present(3) && present(2), "the previous generation stays");
-    assert!(!present(1), "older generations go");
+    assert!(!store.failed_manifest_path().exists());
+    assert!(!dir.path().join("manifest.json").exists());
+}
+
+#[test]
+fn a_sync_with_nothing_new_keeps_current() {
+    let fx = abeezee_only();
+    let port = serve(fx.server.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), &fx.sources_sha256);
+    let store = Store::new(dir.path());
+    let first = run(&cfg, &Local(port), &|_| {}).unwrap();
+    assert!(!first.unchanged);
+    let m = run(&cfg, &Local(port), &|_| {}).unwrap();
+    assert!(m.unchanged && m.succeeded());
+    assert_eq!(m.generation, first.generation);
+    assert_eq!(store.current_generation(), first.generation);
+    assert!(!store.generation_dir(&format!("gen-{COMMIT}-2")).exists());
+}
+
+#[test]
+fn too_many_failed_faces_keep_current_and_fail_the_run() {
+    let fx = faces();
+    let port = serve(fx.server.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), &fx.sources_sha256);
+    cfg.tuning.max_failed_percent = 100.0;
+    run(&cfg, &Local(port), &|_| {}).unwrap();
+    let store = Store::new(dir.path());
+    let good = std::fs::read(store.current_manifest_path()).unwrap();
+
+    // One face of five fails, above the default 1%.
+    cfg.tuning.max_failed_percent = 1.0;
+    cfg.tuning.force = true;
+    let m = run(&cfg, &Local(port), &|_| {}).unwrap();
+    assert!(!m.succeeded());
+    assert!(
+        m.refused_switch
+            .as_deref()
+            .unwrap()
+            .contains("1 of 5 faces")
+    );
+    assert_eq!(store.current_generation(), Some(format!("gen-{COMMIT}-1")));
+    assert_eq!(std::fs::read(store.current_manifest_path()).unwrap(), good);
+    assert!(!store.generation_dir(&format!("gen-{COMMIT}-2")).exists());
+    let failed: Value =
+        serde_json::from_slice(&std::fs::read(store.failed_manifest_path()).unwrap()).unwrap();
+    assert_eq!(failed["precompute"]["failures"][0]["family"], "Adobe");
+    assert!(failed["refused_switch"].is_string());
 }

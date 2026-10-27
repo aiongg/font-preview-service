@@ -10,8 +10,8 @@
 //! <root>/manifest.failed.json                        report of the last sync with fetch failures
 //! ```
 //!
-//! `sync` keeps the generation `current` pointed to before its switch, since servers may still
-//! read it until they reload, and removes the others.
+//! `sync` keeps the two generations before the new one, since servers may still read the previous
+//! one until they reload, and removes the others.
 
 use craft_font_store::sha256_hex;
 use std::fs;
@@ -109,18 +109,61 @@ impl Store {
         fs::File::open(&self.root)?.sync_all()
     }
 
-    /// Removes every generation not named in `keep`.
-    pub fn prune_generations(&self, keep: &[&str]) -> io::Result<()> {
-        for name in self.generations() {
-            if !keep.contains(&name.as_str()) {
-                fs::remove_dir_all(self.generation_dir(&name))?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn failed_manifest_path(&self) -> PathBuf {
         self.root.join("manifest.failed.json")
+    }
+
+    /// Fsyncs every file and directory under `dir`, and `dir` itself.
+    pub fn sync_tree(&self, dir: &Path) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                self.sync_tree(&entry.path())?;
+            } else {
+                fs::File::open(entry.path())?.sync_all()?;
+            }
+        }
+        fs::File::open(dir)?.sync_all()
+    }
+
+    /// Clean-up once `current` points to generation `name`: removes the failure report, a
+    /// `manifest.json` at the root (volumes synced by releases before generations have one), and
+    /// every generation except `name` and the `keep` newest complete others, by their manifest's
+    /// time. Returns what it could not remove.
+    pub fn after_switch(&self, name: &str, keep: usize) -> Vec<String> {
+        let mut problems = Vec::new();
+        for path in [self.failed_manifest_path(), self.root.join(MANIFEST)] {
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    problems.push(format!("removing {}: {e}", path.display()));
+                }
+                _ => {}
+            }
+        }
+        let mut others: Vec<(Option<std::time::SystemTime>, String)> = self
+            .generations()
+            .into_iter()
+            .filter(|g| g != name)
+            .map(|g| {
+                let built = fs::metadata(self.generation_dir(&g).join(MANIFEST))
+                    .and_then(|m| m.modified())
+                    .ok();
+                (built, g)
+            })
+            .collect();
+        // Newest first; a generation without a manifest is incomplete and goes.
+        others.sort_by(|a, b| b.cmp(a));
+        let kept = others
+            .iter()
+            .filter(|(built, _)| built.is_some())
+            .take(keep);
+        let kept: Vec<String> = kept.map(|(_, g)| g.clone()).collect();
+        for (_, g) in others.iter().filter(|(_, g)| !kept.contains(g)) {
+            if let Err(e) = fs::remove_dir_all(self.generation_dir(g)) {
+                problems.push(format!("removing generation {g}: {e}"));
+            }
+        }
+        problems
     }
 
     /// Deletes `.*.tmp` files that interrupted `put` calls left in the blob directories.

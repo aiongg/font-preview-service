@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use craft_font_store::sha256_hex;
-use font_preview_service::sync::{Config, Fetch};
+use font_preview_service::sync::{Config, Fetch, Tuning};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -142,5 +142,6 @@ pub fn config(dir: &std::path::Path, sha: &str) -> Config {
         repo: "aiongg/craft-font-index".into(),
         commit: COMMIT.into(),
         sources_sha256: sha.into(),
+        tuning: Tuning::default(),
     }
 }

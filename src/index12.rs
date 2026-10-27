@@ -44,6 +44,8 @@ pub struct File {
     #[serde(default)]
     pub sha256: String,
     #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
     pub sample_script: Option<String>,
     #[serde(default)]
     pub sample_text: Option<String>,
