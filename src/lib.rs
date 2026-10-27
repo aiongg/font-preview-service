@@ -1,3 +1,4 @@
+pub mod faces;
 pub mod index12;
 pub mod precompute;
 pub mod store;
