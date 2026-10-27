@@ -5,7 +5,18 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
+craft-font-store = { git = "https://github.com/storytold/craft-libs", rev = "9ff719499d8f4730b93071abed993e5f12fe1be8" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1.54.1", features = ["full"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tempfile = "3"
+ureq = { version = "3", default-features = false }
+
+[lints.clippy]
+cognitive_complexity = "deny"
+too_many_arguments = "deny"
+wildcard_imports = "deny"
