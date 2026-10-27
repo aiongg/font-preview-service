@@ -16,7 +16,7 @@ ExecStartPre=-/usr/bin/docker rm -f fps
 ExecStartPre=/bin/sh -c 'docker image inspect ${FPS_IMAGE} >/dev/null 2>&1 || docker pull ${FPS_IMAGE}'
 # Clients reach the origin only through Cloudflare, which sets CF-Connecting-IP; the rate
 # limit keys on it. FACE_CACHE bounds the parsed-font cache for the container's memory limit.
-ExecStart=/usr/bin/docker run --rm --name fps --network fps \
+ExecStart=/usr/bin/docker run --rm --init --name fps --network fps \
   --user 65532:65532 --read-only --tmpfs /tmp:size=64m \
   --cap-drop ALL --security-opt no-new-privileges \
   --memory 1200m --memory-swap 1200m --cpus 1 --pids-limit 256 \
