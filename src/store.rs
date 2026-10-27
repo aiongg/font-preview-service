@@ -3,14 +3,24 @@
 //! ```text
 //! <root>/files/<first 2 hex of sha256>/<sha256>      upstream font files
 //! <root>/licences/<first 2 hex of sha256>/<sha256>   licence texts
-//! <root>/manifest.json                               last fully successful sync
-//! <root>/manifest.failed.json                        report of the last sync with failures
+//! <root>/gen-<index commit>-<n>/manifest.json       a clean sync's manifest and precompute report
+//! <root>/gen-<index commit>-<n>/static/<sha256>/<inst>.woff2
+//!                                                    static subsets (`sample`, `ascii`, `var`)
+//! <root>/current -> gen-<index commit>-<n>           the generation servers read
+//! <root>/manifest.failed.json                        report of the last sync with fetch failures
 //! ```
+//!
+//! `sync` keeps the generation `current` pointed to before its switch, since servers may still
+//! read it until they reload, and removes the others.
 
 use craft_font_store::sha256_hex;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+pub const MANIFEST: &str = "manifest.json";
+const CURRENT: &str = "current";
+const GEN_PREFIX: &str = "gen-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -41,8 +51,72 @@ impl Store {
         &self.root
     }
 
-    pub fn manifest_path(&self) -> PathBuf {
-        self.root.join("manifest.json")
+    pub fn current_link(&self) -> PathBuf {
+        self.root.join(CURRENT)
+    }
+
+    /// The manifest of the generation `current` points to.
+    pub fn current_manifest_path(&self) -> PathBuf {
+        self.current_link().join(MANIFEST)
+    }
+
+    pub fn generation_dir(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+
+    /// The name `current` points to, if it is a symlink.
+    pub fn current_generation(&self) -> Option<String> {
+        let target = fs::read_link(self.current_link()).ok()?;
+        Some(target.file_name()?.to_str()?.to_owned())
+    }
+
+    /// Names of the generation directories, all commits.
+    fn generations(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.starts_with(GEN_PREFIX))
+            .collect()
+    }
+
+    /// Creates `gen-<commit>-<n>`, `n` one above the highest existing for this commit.
+    pub fn new_generation(&self, commit: &str) -> io::Result<(String, PathBuf)> {
+        let prefix = format!("{GEN_PREFIX}{commit}-");
+        let n = self
+            .generations()
+            .iter()
+            .filter_map(|name| name.strip_prefix(&prefix)?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let name = format!("{prefix}{n}");
+        let dir = self.generation_dir(&name);
+        fs::create_dir(&dir)?;
+        Ok((name, dir))
+    }
+
+    /// Points `current` at generation `name`: a new symlink renamed over the old one, which
+    /// readers see atomically.
+    pub fn switch_current(&self, name: &str) -> io::Result<()> {
+        let tmp = self.root.join(".current.tmp");
+        let _ = fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(name, &tmp)?;
+        fs::rename(&tmp, self.current_link())?;
+        fs::File::open(&self.root)?.sync_all()
+    }
+
+    /// Removes every generation not named in `keep`.
+    pub fn prune_generations(&self, keep: &[&str]) -> io::Result<()> {
+        for name in self.generations() {
+            if !keep.contains(&name.as_str()) {
+                fs::remove_dir_all(self.generation_dir(&name))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn failed_manifest_path(&self) -> PathBuf {
@@ -123,7 +197,10 @@ mod tests {
             store.path(Kind::Licence, &sha),
             PathBuf::from(format!("/data/licences/ab/{sha}"))
         );
-        assert_eq!(store.manifest_path(), PathBuf::from("/data/manifest.json"));
+        assert_eq!(
+            store.current_manifest_path(),
+            PathBuf::from("/data/current/manifest.json")
+        );
     }
 
     #[test]

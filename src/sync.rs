@@ -1,13 +1,17 @@
 //! `font-preview-service sync`: mirrors every font and licence file the pinned index lists into the
-//! content-addressed store, then writes `manifest.json`.
+//! content-addressed store, then builds a generation (manifest and static subsets) and switches
+//! `current` to it.
 
-use crate::store::{Kind, Store};
+use crate::index12;
+use crate::precompute::{self, Face};
+use crate::store::{Kind, MANIFEST, Store};
 use craft_font_store::{
     Cancel, Client, FontFile, Index, IndexPin, SourceEntry, SourcesFile, sha256_hex, verify_font,
 };
 use serde::Serialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -147,6 +151,11 @@ pub struct Manifest {
     pub sources: Vec<SourceReport>,
     pub totals: Totals,
     pub failures: Vec<Failure>,
+    /// The generation directory a clean run built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precompute: Option<precompute::Report>,
 }
 
 /// Tries each URL in turn and returns the first body `accept` takes. A refusal (403 from jsDelivr
@@ -177,11 +186,27 @@ fn read_sources(cfg: &Config, pin: &IndexPin, fetch: &dyn Fetch) -> Result<Sourc
 }
 
 /// Reads an index, preferring its gzip form and falling back to the plain file when no mirror
-/// serves a usable gzip.
-fn read_index(entry: &SourceEntry, pin: &IndexPin, fetch: &dyn Fetch) -> Result<Index, String> {
+/// serves a usable gzip. The second value reads the same verified JSON for the 1.2 fields.
+fn read_index(
+    entry: &SourceEntry,
+    pin: &IndexPin,
+    fetch: &dyn Fetch,
+) -> Result<(Index, index12::Index), String> {
     let attempt = |path: &str, gz: bool| {
         fetch_first(fetch, &pin.file_urls(path), MAX_INDEX_BYTES, &|bytes| {
-            entry.read(bytes, gz).map_err(|e| e.to_string())
+            let index = entry.read(bytes, gz).map_err(|e| e.to_string())?;
+            let json = if gz {
+                let mut json = Vec::new();
+                flate2::read::GzDecoder::new(bytes)
+                    .take(MAX_INDEX_BYTES)
+                    .read_to_end(&mut json)
+                    .map_err(|e| e.to_string())?;
+                json
+            } else {
+                bytes.to_vec()
+            };
+            let view = index12::Index::from_json(&json).map_err(|e| e.to_string())?;
+            Ok((index, view))
         })
     };
     match entry.gz() {
@@ -346,8 +371,9 @@ fn run_jobs(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Runs the sync. `Err` means the index could not be read at all; per-file problems are in the
-/// returned manifest's `failures`.
+/// Runs the sync. `Err` means the index could not be read at all, or the generation could not be
+/// written; per-file problems are in the returned manifest's `failures`, per-subset ones in its
+/// `precompute` report.
 pub fn run(
     cfg: &Config,
     fetch: &dyn Fetch,
@@ -365,10 +391,12 @@ pub fn run(
     ));
     let mut seen = HashMap::new();
     let (mut reports, mut jobs, mut failures) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut seen_faces, mut faces) = (HashSet::new(), Vec::new());
     for entry in &sources.indexes {
         match read_index(entry, &pin, fetch) {
-            Ok(index) => {
+            Ok((index, view)) => {
                 let report = collect_jobs(&entry.source, &index, &mut seen, &mut jobs);
+                precompute::collect_faces(&view, &mut seen_faces, &mut faces);
                 log(&format!(
                     "{}: {} families, {} files",
                     entry.source, report.families, report.files
@@ -391,20 +419,69 @@ pub fn run(
         failed: failures.len(),
         ..totals
     };
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         index_repo: cfg.repo.clone(),
         index_commit: cfg.commit.clone(),
         sources_sha256: cfg.sources_sha256.clone(),
         sources: reports,
         totals,
         failures,
+        generation: None,
+        precompute: None,
     };
-    write_manifest(&store, &manifest)?;
     log(&format!(
-        "done: {} fetched, {} already present, {} failed",
+        "fetch: {} fetched, {} already present, {} failed",
         manifest.totals.fetched, manifest.totals.skipped, manifest.totals.failed
     ));
+    if manifest.failures.is_empty() {
+        build_generation(&store, &faces, &mut manifest, log)?;
+    } else {
+        write_manifest(&store.failed_manifest_path(), &manifest)?;
+        log("fetch failures: no new generation; `current` is unchanged");
+    }
     Ok(manifest)
+}
+
+/// Precomputes the static subsets into a new generation, writes its manifest last, switches
+/// `current` to it and removes generations older than the one it replaced.
+fn build_generation(
+    store: &Store,
+    faces: &[Face],
+    manifest: &mut Manifest,
+    log: &(dyn Fn(&str) + Sync),
+) -> Result<(), String> {
+    let (name, dir) = store
+        .new_generation(&manifest.index_commit)
+        .map_err(|e| format!("creating a generation in {}: {e}", store.root().display()))?;
+    let report = precompute::run(faces, store, &dir);
+    for f in &report.failures {
+        log(&format!(
+            "FAILED subset {} / {} {}: {}",
+            f.family, f.sha256, f.inst, f.reason
+        ));
+    }
+    log(&format!(
+        "precompute: {} faces, {} sample, {} ascii, {} var written, {} failed",
+        report.faces,
+        report.written.sample,
+        report.written.ascii,
+        report.written.var,
+        report.failures.len()
+    ));
+    manifest.generation = Some(name.clone());
+    manifest.precompute = Some(report);
+    write_manifest(&dir.join(MANIFEST), manifest)?;
+    let previous = store.current_generation();
+    store
+        .switch_current(&name)
+        .map_err(|e| format!("switching current to {name}: {e}"))?;
+    let mut keep = vec![name.as_str()];
+    keep.extend(previous.as_deref());
+    store
+        .prune_generations(&keep)
+        .map_err(|e| format!("removing old generations: {e}"))?;
+    log(&format!("current -> {name}"));
+    Ok(())
 }
 
 /// Takes an exclusive lock on `FONTS_DIR/.sync.lock`, held until the returned file is dropped.
@@ -425,21 +502,15 @@ fn lock(store: &Store) -> Result<std::fs::File, String> {
     }
 }
 
-/// A clean run replaces `manifest.json`. A run with failures writes `manifest.failed.json` and
-/// leaves the last good manifest in place.
-fn write_manifest(store: &Store, manifest: &Manifest) -> Result<(), String> {
+/// Writes `manifest` to `path` through a synced temporary file.
+fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?;
-    let path = if manifest.failures.is_empty() {
-        store.manifest_path()
-    } else {
-        store.failed_manifest_path()
-    };
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut f, &json)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, &path)
+        std::fs::rename(&tmp, path)
     };
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
