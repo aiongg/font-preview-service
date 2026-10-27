@@ -467,6 +467,9 @@ pub fn run(
     let store = Store::new(&cfg.fonts_dir);
     let _lock = lock(&store)?;
     store.remove_stale_tmp();
+    for problem in store.remove_incomplete_generations() {
+        log(&format!("WARNING {problem}"));
+    }
     let pin = cfg.pin();
     let sources =
         read_sources(cfg, &pin, fetch).map_err(|e| format!("reading sources.json: {e}"))?;
@@ -529,6 +532,7 @@ pub fn run(
         log(&format!("unchanged: current -> {name} stays"));
         manifest.generation = Some(name);
         manifest.unchanged = true;
+        store.remove_failed_manifest();
     } else {
         build_generation(&store, &faces, &mut manifest, &cfg.tuning, log)?;
     }
@@ -617,11 +621,12 @@ fn build_generation(
     store
         .sync_tree(&dir)
         .map_err(|e| format!("syncing {}: {e}", dir.display()))?;
+    let previous = store.current_generation();
     store
         .switch_current(&name)
         .map_err(|e| format!("switching current to {name}: {e}"))?;
     log(&format!("current -> {name}"));
-    for warning in store.after_switch(&name, KEPT_GENERATIONS) {
+    for warning in store.after_switch(&name, previous.as_deref(), KEPT_GENERATIONS) {
         log(&format!("WARNING {warning}"));
     }
     Ok(())

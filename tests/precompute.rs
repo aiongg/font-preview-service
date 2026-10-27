@@ -233,3 +233,66 @@ fn too_many_failed_faces_keep_current_and_fail_the_run() {
     assert_eq!(failed["precompute"]["failures"][0]["family"], "Adobe");
     assert!(failed["refused_switch"].is_string());
 }
+
+#[test]
+fn a_run_removes_incomplete_generations_but_not_the_current_one() {
+    let fx = abeezee_only();
+    let port = serve(fx.server.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), &fx.sources_sha256);
+    let store = Store::new(dir.path());
+    run(&cfg, &Local(port), &|_| {}).unwrap();
+    let leftover = store.generation_dir(&format!("gen-{COMMIT}-7"));
+    std::fs::create_dir(&leftover).unwrap();
+    std::fs::write(leftover.join("partial"), b"x").unwrap();
+    std::fs::write(dir.path().join("manifest.failed.json.99.tmp"), b"{").unwrap();
+
+    // Unchanged run: the leftover goes, current stays.
+    let m = run(&cfg, &Local(port), &|_| {}).unwrap();
+    assert!(m.unchanged);
+    assert!(!leftover.exists());
+    assert!(!dir.path().join("manifest.failed.json.99.tmp").exists());
+    assert!(store.generation_dir(&format!("gen-{COMMIT}-1")).exists());
+
+    // Even a current generation without a manifest is not removed.
+    std::fs::remove_file(store.current_manifest_path()).unwrap();
+    let mut forced = config(dir.path(), &fx.sources_sha256);
+    forced.tuning.force = true;
+    run(&forced, &Local(port), &|_| {}).unwrap();
+    assert_eq!(store.current_generation(), Some(format!("gen-{COMMIT}-2")));
+}
+
+#[test]
+fn a_rolled_back_generation_survives_the_next_run() {
+    let fx = abeezee_only();
+    let port = serve(fx.server.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), &fx.sources_sha256);
+    cfg.tuning.force = true;
+    let store = Store::new(dir.path());
+    let generation = |n: u32| format!("gen-{COMMIT}-{n}");
+    for _ in 1..=4 {
+        run(&cfg, &Local(port), &|_| {}).unwrap();
+    }
+    // Generation 1 was already pruned; roll back to the oldest kept one, 2.
+    store.switch_current(&generation(2)).unwrap();
+    run(&cfg, &Local(port), &|_| {}).unwrap();
+    assert_eq!(store.current_generation(), Some(generation(5)));
+    let present = |n| store.generation_dir(&generation(n)).exists();
+    assert!(present(2) && present(5) && present(4) && present(3));
+    assert!(!present(1));
+}
+
+#[test]
+fn a_skipped_run_removes_an_old_failure_report() {
+    let fx = abeezee_only();
+    let port = serve(fx.server.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), &fx.sources_sha256);
+    let store = Store::new(dir.path());
+    run(&cfg, &Local(port), &|_| {}).unwrap();
+    std::fs::write(store.failed_manifest_path(), b"{}").unwrap();
+    let m = run(&cfg, &Local(port), &|_| {}).unwrap();
+    assert!(m.unchanged);
+    assert!(!store.failed_manifest_path().exists());
+}

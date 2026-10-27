@@ -50,6 +50,7 @@ The image runs the same way under these systemd units and under Kubernetes; the 
 - Configuration comes only from environment variables. Numeric nonroot UID (65532), read-only root filesystem, logs to stdout/stderr.
 - `font-preview-service` serves; `font-preview-service sync` fills the fonts volume and exits (a timer here; a CronJob, Job or initContainer elsewhere).
 - The server is stateless apart from the fonts volume, which it mounts read-only, so several replicas can share one volume (ReadOnlyMany). Only `sync` writes to it, into a new generation directory, and switches the `current` symlink atomically (rename).
+- Disk use peaks at the blobs (about 4 GB) plus up to 4 generations of about 85 MB each (about 340 MB): the one being built, `current`, and the two kept before it.
 - The server notices a new generation itself by polling `current`; `SIGHUP` reloads at once.
 - `/healthz` is liveness; `/readyz` fails until a manifest is loaded. `SIGTERM` drains open requests, then exits.
 - Metrics are on their own port, not proxied.

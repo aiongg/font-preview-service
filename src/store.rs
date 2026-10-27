@@ -128,9 +128,10 @@ impl Store {
 
     /// Clean-up once `current` points to generation `name`: removes the failure report, a
     /// `manifest.json` at the root (volumes synced by releases before generations have one), and
-    /// every generation except `name` and the `keep` newest complete others, by their manifest's
-    /// time. Returns what it could not remove.
-    pub fn after_switch(&self, name: &str, keep: usize) -> Vec<String> {
+    /// every generation except `name`, `previous` (what `current` pointed to before, which an
+    /// operator may have rolled back to and servers may still serve) and the `keep` newest
+    /// complete others, by their manifest's time (`previous` is usually among them). Returns what it could not remove.
+    pub fn after_switch(&self, name: &str, previous: Option<&str>, keep: usize) -> Vec<String> {
         let mut problems = Vec::new();
         for path in [self.failed_manifest_path(), self.root.join(MANIFEST)] {
             match fs::remove_file(&path) {
@@ -157,7 +158,8 @@ impl Store {
             .iter()
             .filter(|(built, _)| built.is_some())
             .take(keep);
-        let kept: Vec<String> = kept.map(|(_, g)| g.clone()).collect();
+        let mut kept: Vec<String> = kept.map(|(_, g)| g.clone()).collect();
+        kept.extend(previous.map(str::to_owned));
         for (_, g) in others.iter().filter(|(_, g)| !kept.contains(g)) {
             if let Err(e) = fs::remove_dir_all(self.generation_dir(g)) {
                 problems.push(format!("removing generation {g}: {e}"));
@@ -166,8 +168,43 @@ impl Store {
         problems
     }
 
-    /// Deletes `.*.tmp` files that interrupted `put` calls left in the blob directories.
+    /// Removes the failure report, if any.
+    pub fn remove_failed_manifest(&self) {
+        let _ = fs::remove_file(self.failed_manifest_path());
+    }
+
+    /// Removes every generation without a `manifest.json` except the one `current` points to:
+    /// builds that were killed or refused and never got switched in.
+    pub fn remove_incomplete_generations(&self) -> Vec<String> {
+        let current = self.current_generation();
+        let mut problems = Vec::new();
+        for g in self.generations() {
+            let dir = self.generation_dir(&g);
+            if current.as_deref() != Some(g.as_str())
+                && !dir.join(MANIFEST).exists()
+                && let Err(e) = fs::remove_dir_all(&dir)
+            {
+                problems.push(format!("removing incomplete generation {g}: {e}"));
+            }
+        }
+        problems
+    }
+
+    /// Deletes the temporary files that interrupted writes left: `.*.tmp` in the blob
+    /// directories, and `.current.tmp` and `manifest*.tmp` in the root.
     pub fn remove_stale_tmp(&self) {
+        if let Ok(entries) = fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".tmp")
+                    && (name == ".current.tmp" || name.starts_with("manifest"))
+                    && entry.file_type().is_ok_and(|t| !t.is_dir())
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
         for kind in [Kind::File, Kind::Licence] {
             let Ok(subdirs) = fs::read_dir(self.root.join(kind.dir())) else {
                 continue;
