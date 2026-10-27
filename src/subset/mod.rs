@@ -1,10 +1,6 @@
 //! Preview subsets: one face, a set of codepoints and an instance in, a
 //! renamed WOFF2 out. Synchronous and free of I/O.
 
-// The sync and HTTP layers are the callers; until they land, parts of this
-// module have none.
-#![allow(dead_code, unused_imports)]
-
 mod cff;
 pub mod closure;
 pub mod codepoints;
@@ -52,9 +48,27 @@ pub fn subset(
     naming: &Naming,
     quality: Quality,
 ) -> Result<Vec<u8>, Error> {
+    encode_woff2(
+        &subset_renamed(font, codepoints, instance, naming)?,
+        quality,
+    )
+}
+
+/// [`subset`] before WOFF2 encoding: the renamed sfnt, for checks that
+/// need to read the subset.
+pub fn subset_renamed(
+    font: &[u8],
+    codepoints: &BTreeSet<u32>,
+    instance: &Instance,
+    naming: &Naming,
+) -> Result<Vec<u8>, Error> {
     let sfnt = subset_sfnt(font, codepoints, instance)?;
-    let renamed = rename::rename(&sfnt, naming)?;
-    Ok(woff2::encode(&renamed, quality)?)
+    rename::rename(&sfnt, naming)
+}
+
+/// Encodes a [`subset_renamed`] result as WOFF2.
+pub fn encode_woff2(sfnt: &[u8], quality: Quality) -> Result<Vec<u8>, Error> {
+    Ok(woff2::encode(sfnt, quality)?)
 }
 
 fn subset_sfnt(
