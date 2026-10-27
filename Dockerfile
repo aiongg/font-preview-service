@@ -6,6 +6,7 @@ FROM dhi.io/rust:1-dev AS build
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 RUN cargo build --locked --release && \
     cp target/release/font-preview-service /build/font-preview-service
