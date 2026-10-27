@@ -105,6 +105,12 @@ async fn readyz(State(app): AppState) -> Response {
         return error(StatusCode::SERVICE_UNAVAILABLE, "shutting down\n");
     }
     match app.generation() {
+        // Sync prunes old generations; if loading new ones keeps failing it can remove the one
+        // being served, and its precomputed files are gone.
+        Some(g) if !g.dir.is_dir() => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "generation directory is gone\n",
+        ),
         Some(_) => "ready".into_response(),
         None => not_ready(),
     }

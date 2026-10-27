@@ -11,6 +11,7 @@ axum = "0.8.9"
 craft-font-store = { git = "https://github.com/storytold/craft-libs", rev = "9ff719499d8f4730b93071abed993e5f12fe1be8" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 harfbuzz-subset-sys = { path = "crates/harfbuzz-subset-sys" }
+hyper-util = { version = "0.1.21", features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 lru = "0.16"
 rustybuzz = "0.20.1"
 serde = { version = "1", features = ["derive"] }

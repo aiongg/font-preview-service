@@ -67,6 +67,8 @@ pub struct App {
     store: Store,
     current: RwLock<Option<Arc<Generation>>>,
     last_error: Mutex<Option<String>>,
+    /// Serialises reloads so an older load finishing last cannot replace a newer generation.
+    reload_lock: Mutex<()>,
     /// Font files for the subsetter.
     faces: Lru<Bytes>,
     responses: Lru<Arc<Cached>>,
@@ -85,6 +87,7 @@ impl App {
             store: Store::new(&config.fonts_dir),
             current: RwLock::new(None),
             last_error: Mutex::new(None),
+            reload_lock: Mutex::new(()),
             faces: Lru::new(config.face_cache, config.face_cache_bytes),
             responses: Lru::new(usize::MAX, config.response_cache_bytes),
             files_br: Lru::new(usize::MAX, config.files_br_cache_bytes),
@@ -147,6 +150,10 @@ impl App {
     }
 
     fn try_reload(&self) -> Result<bool, String> {
+        let _serial = self
+            .reload_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let name = self.store.current_generation().ok_or_else(|| {
             format!(
                 "{} is not a symlink to a generation",
@@ -299,6 +306,64 @@ async fn housekeeping(app: Arc<App>) {
     }
 }
 
+/// How long a client may take to send its request headers.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serves `router` until `stop` fires, then stops accepting and waits for open connections.
+/// `axum::serve` sets no connection timers, so a client that sends its headers slowly would
+/// otherwise hold a connection forever.
+async fn serve(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    stop: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::server::graceful::GracefulShutdown;
+    use hyper_util::service::TowerToHyperService;
+
+    let mut builder = Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(20));
+    let graceful = GracefulShutdown::new();
+    let stopping = stopped(stop);
+    tokio::pin!(stopping);
+    loop {
+        let (stream, peer) = tokio::select! {
+            () = &mut stopping => break,
+            accepted = listener.accept() => match accepted {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // Typically file-descriptor exhaustion; back off instead of spinning.
+                    eprintln!("accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let service = TowerToHyperService::new(
+            router
+                .clone()
+                .layer(axum::Extension(axum::extract::ConnectInfo(peer))),
+        );
+        let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+        let conn = graceful.watch(conn.into_owned());
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+    drop(listener);
+    graceful.shutdown().await;
+    Ok(())
+}
+
 async fn run(config: Config) -> i32 {
     let app = App::new(config.clone());
     reload_in_background(&app).await;
@@ -322,16 +387,10 @@ async fn run(config: Config) -> i32 {
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(signals(app.clone(), stop_tx));
     tokio::spawn(housekeeping(app.clone()));
-    let metrics = axum::serve(metrics_listener, app.metrics_router())
-        .with_graceful_shutdown(stopped(stop_rx.clone()));
-    tokio::spawn(async move { metrics.await });
-    let server = axum::serve(
-        listener,
-        app.router()
-            .into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(stopped(stop_rx.clone()));
-    let mut task = tokio::spawn(async move { server.await });
+    let metrics = serve(metrics_listener, app.metrics_router(), stop_rx.clone());
+    tokio::spawn(metrics);
+    let server = serve(listener, app.router(), stop_rx.clone());
+    let mut task = tokio::spawn(server);
     tokio::select! {
         result = &mut task => {
             if let Ok(Err(e)) | Err(e) = result.map_err(std::io::Error::other) {

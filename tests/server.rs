@@ -385,6 +385,9 @@ async fn readiness_follows_the_loaded_generation() {
     let (status, ..) = get(&app, &face_url(ABEEZEE, "list", &sample(LATIN)), &[]).await;
     assert_eq!(status, 200);
 
+    std::fs::remove_dir_all(&app.generation().unwrap().dir).unwrap();
+    assert_eq!(get(&app, "/readyz", &[]).await.0, 503, "pruned generation");
+
     app.begin_shutdown();
     assert_eq!(get(&app, "/readyz", &[]).await.0, 503);
     assert_eq!(get(&app, "/healthz", &[]).await.0, 200);
