@@ -303,7 +303,7 @@ fn run_jobs(
                     if let Outcome::Failed(reason) = &outcome {
                         log(&format!("FAILED {} / {}: {reason}", job.family, job.label));
                     }
-                    if n % LOG_EVERY == 0 {
+                    if n.is_multiple_of(LOG_EVERY) {
                         log(&format!("{n}/{} files handled", jobs.len()));
                     }
                     let Ok(mut guard) = results.lock() else {
