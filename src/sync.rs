@@ -1,13 +1,17 @@
 //! `font-preview-service sync`: mirrors every font and licence file the pinned index lists into the
-//! content-addressed store, then writes `manifest.json`.
+//! content-addressed store, then builds a generation (manifest and static subsets) and switches
+//! `current` to it.
 
-use crate::store::{Kind, Store};
+use crate::index12;
+use crate::precompute::{self, Face};
+use crate::store::{Kind, MANIFEST, Store};
 use craft_font_store::{
     Cancel, Client, FontFile, Index, IndexPin, SourceEntry, SourcesFile, sha256_hex, verify_font,
 };
 use serde::Serialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,12 +49,81 @@ impl Fetch for HttpFetch {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub fonts_dir: PathBuf,
     pub repo: String,
     pub commit: String,
     pub sources_sha256: String,
+    pub tuning: Tuning,
+}
+
+/// How the precompute step runs, from the `SYNC_*` variables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tuning {
+    /// `SYNC_THREADS`; default the available parallelism, at most 4.
+    pub threads: usize,
+    /// `SYNC_MEMORY_MB`, default 512: the summed size of font files precomputed at once.
+    pub memory_bytes: u64,
+    /// `SYNC_MAX_FAILED_PERCENT`, default 1: above this share of faces with a failed subset, the
+    /// run keeps `current` and fails.
+    pub max_failed_percent: f64,
+    /// `SYNC_FORCE=1`: build a generation even when nothing changed.
+    pub force: bool,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            threads: std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(4),
+            memory_bytes: 512 << 20,
+            max_failed_percent: 1.0,
+            force: false,
+        }
+    }
+}
+
+impl Tuning {
+    fn from_lookup(get: &impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        fn parse<T: std::str::FromStr>(
+            get: &impl Fn(&str) -> Option<String>,
+            key: &str,
+        ) -> Result<Option<T>, String> {
+            match get(key).filter(|v| !v.is_empty()) {
+                None => Ok(None),
+                Some(v) => v
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| format!("{key} `{v}` is not a valid value")),
+            }
+        }
+        let default = Self::default();
+        let threads = parse::<usize>(get, "SYNC_THREADS")?.unwrap_or(default.threads);
+        let memory_mb = parse::<u64>(get, "SYNC_MEMORY_MB")?;
+        let max_failed_percent =
+            parse::<f64>(get, "SYNC_MAX_FAILED_PERCENT")?.unwrap_or(default.max_failed_percent);
+        if threads == 0 || memory_mb == Some(0) {
+            return Err("SYNC_THREADS and SYNC_MEMORY_MB must be above 0".into());
+        }
+        if !(0.0..=100.0).contains(&max_failed_percent) {
+            return Err("SYNC_MAX_FAILED_PERCENT must be between 0 and 100".into());
+        }
+        Ok(Self {
+            threads,
+            memory_bytes: memory_mb.map_or(default.memory_bytes, |mb| mb << 20),
+            max_failed_percent,
+            force: get("SYNC_FORCE").as_deref() == Some("1"),
+        })
+    }
+
+    fn limits(&self) -> precompute::Limits {
+        precompute::Limits {
+            threads: self.threads,
+            memory_bytes: self.memory_bytes,
+        }
+    }
 }
 
 fn is_hex(s: &str, len: usize) -> bool {
@@ -70,7 +143,8 @@ fn is_repo(s: &str) -> bool {
 }
 
 impl Config {
-    /// Reads `FONTS_DIR`, `INDEX_REPO`, `INDEX_COMMIT` and `INDEX_SHA256` through `get`.
+    /// Reads `FONTS_DIR`, `INDEX_REPO`, `INDEX_COMMIT`, `INDEX_SHA256` and the `SYNC_*` tuning
+    /// through `get`.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let need = |key: &str| {
             get(key)
@@ -92,11 +166,13 @@ impl Config {
         if !is_hex(&sources_sha256, 64) {
             return Err("INDEX_SHA256 must be 64 lowercase hex digits".into());
         }
+        let tuning = Tuning::from_lookup(&get)?;
         Ok(Self {
             fonts_dir,
             repo,
             commit,
             sources_sha256,
+            tuning,
         })
     }
 
@@ -147,6 +223,24 @@ pub struct Manifest {
     pub sources: Vec<SourceReport>,
     pub totals: Totals,
     pub failures: Vec<Failure>,
+    /// The generation directory a clean run built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precompute: Option<precompute::Report>,
+    /// Why a generation was built but `current` not switched to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused_switch: Option<String>,
+    /// Nothing changed since the generation `current` points to, which stays.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unchanged: bool,
+}
+
+impl Manifest {
+    /// Whether `current` now holds this run's index: the exit status of `sync`.
+    pub fn succeeded(&self) -> bool {
+        self.failures.is_empty() && self.refused_switch.is_none()
+    }
 }
 
 /// Tries each URL in turn and returns the first body `accept` takes. A refusal (403 from jsDelivr
@@ -177,11 +271,27 @@ fn read_sources(cfg: &Config, pin: &IndexPin, fetch: &dyn Fetch) -> Result<Sourc
 }
 
 /// Reads an index, preferring its gzip form and falling back to the plain file when no mirror
-/// serves a usable gzip.
-fn read_index(entry: &SourceEntry, pin: &IndexPin, fetch: &dyn Fetch) -> Result<Index, String> {
+/// serves a usable gzip. The second value reads the same verified JSON for the 1.2 fields.
+fn read_index(
+    entry: &SourceEntry,
+    pin: &IndexPin,
+    fetch: &dyn Fetch,
+) -> Result<(Index, index12::Index), String> {
     let attempt = |path: &str, gz: bool| {
         fetch_first(fetch, &pin.file_urls(path), MAX_INDEX_BYTES, &|bytes| {
-            entry.read(bytes, gz).map_err(|e| e.to_string())
+            let index = entry.read(bytes, gz).map_err(|e| e.to_string())?;
+            let json = if gz {
+                let mut json = Vec::new();
+                flate2::read::GzDecoder::new(bytes)
+                    .take(MAX_INDEX_BYTES)
+                    .read_to_end(&mut json)
+                    .map_err(|e| e.to_string())?;
+                json
+            } else {
+                bytes.to_vec()
+            };
+            let view = index12::Index::from_json(&json).map_err(|e| e.to_string())?;
+            Ok((index, view))
         })
     };
     match entry.gz() {
@@ -346,8 +456,9 @@ fn run_jobs(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Runs the sync. `Err` means the index could not be read at all; per-file problems are in the
-/// returned manifest's `failures`.
+/// Runs the sync. `Err` means the index could not be read at all, or the generation could not be
+/// written; per-file problems are in the returned manifest's `failures`, per-subset ones in its
+/// `precompute` report.
 pub fn run(
     cfg: &Config,
     fetch: &dyn Fetch,
@@ -356,6 +467,9 @@ pub fn run(
     let store = Store::new(&cfg.fonts_dir);
     let _lock = lock(&store)?;
     store.remove_stale_tmp();
+    for problem in store.remove_incomplete_generations() {
+        log(&format!("WARNING {problem}"));
+    }
     let pin = cfg.pin();
     let sources =
         read_sources(cfg, &pin, fetch).map_err(|e| format!("reading sources.json: {e}"))?;
@@ -365,10 +479,12 @@ pub fn run(
     ));
     let mut seen = HashMap::new();
     let (mut reports, mut jobs, mut failures) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut seen_faces, mut faces) = (HashSet::new(), Vec::new());
     for entry in &sources.indexes {
         match read_index(entry, &pin, fetch) {
-            Ok(index) => {
+            Ok((index, view)) => {
                 let report = collect_jobs(&entry.source, &index, &mut seen, &mut jobs);
+                precompute::collect_faces(&view, &mut seen_faces, &mut faces);
                 log(&format!(
                     "{}: {} families, {} files",
                     entry.source, report.families, report.files
@@ -391,21 +507,134 @@ pub fn run(
         failed: failures.len(),
         ..totals
     };
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         index_repo: cfg.repo.clone(),
         index_commit: cfg.commit.clone(),
         sources_sha256: cfg.sources_sha256.clone(),
         sources: reports,
         totals,
         failures,
+        generation: None,
+        precompute: None,
+        refused_switch: None,
+        unchanged: false,
     };
-    write_manifest(&store, &manifest)?;
     log(&format!(
-        "done: {} fetched, {} already present, {} failed",
+        "fetch: {} fetched, {} already present, {} failed",
         manifest.totals.fetched, manifest.totals.skipped, manifest.totals.failed
     ));
+    if !manifest.failures.is_empty() {
+        write_manifest(&store.failed_manifest_path(), &manifest)?;
+        log("fetch failures: no new generation; `current` is unchanged");
+    } else if !cfg.tuning.force
+        && let Some(name) = unchanged_generation(&store, &manifest)
+    {
+        log(&format!("unchanged: current -> {name} stays"));
+        manifest.generation = Some(name);
+        manifest.unchanged = true;
+        store.remove_failed_manifest();
+    } else {
+        build_generation(&store, &faces, &mut manifest, &cfg.tuning, log)?;
+    }
     Ok(manifest)
 }
+
+/// The generation `current` points to, when it exists, holds this index commit and sources, and
+/// this run fetched nothing new.
+fn unchanged_generation(store: &Store, manifest: &Manifest) -> Option<String> {
+    if manifest.totals.fetched != 0 {
+        return None;
+    }
+    let name = store.current_generation()?;
+    if !store.generation_dir(&name).is_dir() {
+        return None;
+    }
+    let bytes = std::fs::read(store.current_manifest_path()).ok()?;
+    let current: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    (current["index_commit"] == manifest.index_commit.as_str()
+        && current["sources_sha256"] == manifest.sources_sha256.as_str())
+    .then_some(name)
+}
+
+fn log_report(report: &precompute::Report, log: &(dyn Fn(&str) + Sync)) {
+    for f in &report.failures {
+        log(&format!(
+            "FAILED subset {} / {} {}: {}",
+            f.family, f.sha256, f.inst, f.reason
+        ));
+    }
+    for w in &report.warnings {
+        log(&format!(
+            "WARNING {} / {}: {}",
+            w.family, w.sha256, w.reason
+        ));
+    }
+    log(&format!(
+        "precompute: {} faces, {} sample, {} ascii, {} var written, {} faces failed",
+        report.faces,
+        report.written.sample,
+        report.written.ascii,
+        report.written.var,
+        report.failed_faces()
+    ));
+}
+
+/// Why precompute failed too often to switch to its generation, if it did.
+fn too_many_failures(report: &precompute::Report, max_percent: f64) -> Option<String> {
+    let failed = report.failed_faces();
+    let allowed = max_percent / 100.0 * report.faces as f64;
+    (failed as f64 > allowed).then(|| {
+        format!(
+            "{failed} of {} faces failed precompute, more than {max_percent}%",
+            report.faces
+        )
+    })
+}
+
+/// Precomputes the static subsets into a new generation, writes its manifest last, syncs it to
+/// disk, switches `current` to it and removes old generations. With too many failed faces, it
+/// removes the new generation instead and reports in `manifest.failed.json`.
+fn build_generation(
+    store: &Store,
+    faces: &[Face],
+    manifest: &mut Manifest,
+    tuning: &Tuning,
+    log: &(dyn Fn(&str) + Sync),
+) -> Result<(), String> {
+    let (name, dir) = store
+        .new_generation(&manifest.index_commit)
+        .map_err(|e| format!("creating a generation in {}: {e}", store.root().display()))?;
+    let report = precompute::run(faces, store, &dir, tuning.limits());
+    log_report(&report, log);
+    let refused = too_many_failures(&report, tuning.max_failed_percent);
+    manifest.precompute = Some(report);
+    if let Some(reason) = refused {
+        log(&format!("{reason}: `current` is unchanged"));
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            log(&format!("WARNING removing {}: {e}", dir.display()));
+        }
+        manifest.refused_switch = Some(reason);
+        return write_manifest(&store.failed_manifest_path(), manifest);
+    }
+    manifest.generation = Some(name.clone());
+    write_manifest(&dir.join(MANIFEST), manifest)?;
+    store
+        .sync_tree(&dir)
+        .map_err(|e| format!("syncing {}: {e}", dir.display()))?;
+    let previous = store.current_generation();
+    store
+        .switch_current(&name)
+        .map_err(|e| format!("switching current to {name}: {e}"))?;
+    log(&format!("current -> {name}"));
+    for warning in store.after_switch(&name, previous.as_deref(), KEPT_GENERATIONS) {
+        log(&format!("WARNING {warning}"));
+    }
+    Ok(())
+}
+
+/// Generations kept besides the new one: servers may still read the previous one until they
+/// reload, and the one before stays for rolling back by hand.
+const KEPT_GENERATIONS: usize = 2;
 
 /// Takes an exclusive lock on `FONTS_DIR/.sync.lock`, held until the returned file is dropped.
 fn lock(store: &Store) -> Result<std::fs::File, String> {
@@ -425,21 +654,15 @@ fn lock(store: &Store) -> Result<std::fs::File, String> {
     }
 }
 
-/// A clean run replaces `manifest.json`. A run with failures writes `manifest.failed.json` and
-/// leaves the last good manifest in place.
-fn write_manifest(store: &Store, manifest: &Manifest) -> Result<(), String> {
+/// Writes `manifest` to `path` through a synced temporary file.
+fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?;
-    let path = if manifest.failures.is_empty() {
-        store.manifest_path()
-    } else {
-        store.failed_manifest_path()
-    };
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut f, &json)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, &path)
+        std::fs::rename(&tmp, path)
     };
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -457,7 +680,7 @@ pub fn main() -> i32 {
         }
     };
     match run(&cfg, &HttpFetch::new(), &|line| println!("{line}")) {
-        Ok(m) if m.failures.is_empty() => 0,
+        Ok(m) if m.succeeded() => 0,
         Ok(_) => 1,
         Err(e) => {
             eprintln!("sync: {e}");
@@ -528,6 +751,9 @@ mod tests {
             ("INDEX_SHA256", "abc"),
             ("INDEX_REPO", "no-slash"),
             ("INDEX_REPO", "a/../b"),
+            ("SYNC_THREADS", "0"),
+            ("SYNC_MEMORY_MB", "lots"),
+            ("SYNC_MAX_FAILED_PERCENT", "101"),
         ] {
             let mut pairs = without(key);
             pairs.push((key, bad.to_string()));
