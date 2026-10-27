@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use skrifa::{FontRef, MetadataProvider};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tower::ServiceExt;
 
 const ABEEZEE: &[u8] = include_bytes!("data/abeezee/ABeeZee-Regular.ttf");
@@ -85,7 +86,7 @@ fn volume() -> &'static Path {
 }
 
 fn app_with(cfg: Config) -> Arc<App> {
-    let app = App::new(cfg);
+    let app = App::new(cfg).unwrap();
     assert!(app.reload().unwrap());
     app
 }
@@ -127,7 +128,7 @@ fn sample(text: &str) -> String {
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let app = App::new(Config::new("/nonexistent"));
+    let app = App::new(Config::new("/nonexistent")).unwrap();
     let (status, _, body) = get(&app, "/healthz", &[]).await;
     assert_eq!(status, 200);
     assert_eq!(&body[..], b"ok");
@@ -360,7 +361,7 @@ async fn readiness_follows_the_loaded_generation() {
     );
     let port = serve(fx.server.clone());
     let dir = tempfile::tempdir().unwrap();
-    let app = App::new(Config::new(dir.path()));
+    let app = App::new(Config::new(dir.path())).unwrap();
     assert_eq!(get(&app, "/readyz", &[]).await.0, 503);
     assert!(app.reload().is_err());
 
@@ -422,6 +423,22 @@ async fn downloads_keep_their_slot_until_the_body_is_gone() {
             .unwrap();
         assert_eq!(&body[..], ABEEZEE);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_download_gives_up_its_slot() {
+    let mut cfg = Config::new(volume());
+    cfg.files_concurrency = 1;
+    cfg.files_queue = 0;
+    let app = app_with(cfg);
+    let url = format!("/v1/files/{}", sha(ABEEZEE));
+    let req = Request::builder().uri(&url).body(Body::empty()).unwrap();
+    let stalled = app.router().oneshot(req).await.unwrap();
+    assert_eq!(stalled.status(), 200);
+    assert_eq!(get(&app, &url, &[]).await.0, 503);
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_eq!(get(&app, &url, &[]).await.0, 200, "the slot went back");
+    drop(stalled);
 }
 
 #[tokio::test]

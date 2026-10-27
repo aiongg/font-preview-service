@@ -23,7 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
@@ -493,6 +493,7 @@ fn font_type(bytes: &[u8]) -> &'static str {
 }
 
 const VARY: (header::HeaderName, &str) = (header::VARY, "Accept-Encoding");
+const BR_HEADERS: [(header::HeaderName, &str); 2] = [VARY, (header::CONTENT_ENCODING, "br")];
 
 async fn file(State(app): AppState, Path(sha): Path<String>, req: Parts) -> Response {
     let Some(generation) = app.generation() else {
@@ -501,22 +502,48 @@ async fn file(State(app): AppState, Path(sha): Path<String>, req: Parts) -> Resp
     let Some(size) = generation.faces.get(&sha).map(|face| face.size) else {
         return not_found();
     };
+    let headers = &req.headers;
+    let br = accepts_br(headers) && size <= MAX_BR_FILE;
+    let br_etag = format!("\"{sha}-br\"");
+    if br && matches(headers, &br_etag) {
+        return immutable(headers, Bytes::new(), &br_etag, "", &BR_HEADERS);
+    }
+    let etag = format!("\"{sha}\"");
+    if matches(headers, &etag) {
+        return immutable(headers, Bytes::new(), &etag, "", &[VARY]);
+    }
     let Some(permit) = app.downloads.acquire().await else {
         return busy();
     };
-    send_file(&app, &sha, size, &req).await.map(|body| {
-        Body::new(Held {
-            body,
-            _permit: permit,
-        })
-    })
+    if br && let Some(response) = compressed_file(&app, &sha, br_etag, &req).await {
+        return response.map(|body| hold(body, permit));
+    }
+    send_file(&app, &sha, etag, headers)
+        .await
+        .map(|body| hold(body, permit))
 }
 
-/// A response body that keeps its download slot until it is sent or dropped. Each download in
-/// flight holds up to a read chunk plus hyper's write buffer, so the slots bound their memory.
+/// How long a download keeps its slot. hyper stops polling a body it cannot write, so a client
+/// that stops reading would otherwise keep the slot as long as its connection stays open. After
+/// this the download goes on without a slot; it then holds no more than its buffered chunks.
+const DOWNLOAD_SLOT_LIMIT: Duration = Duration::from_secs(30);
+
+/// `body` with its download slot, which goes back when the body is sent or dropped, or after
+/// [`DOWNLOAD_SLOT_LIMIT`]. Each download in flight holds up to a read chunk plus hyper's write
+/// buffer, so the slots bound their memory.
+fn hold(body: Body, permit: Permit) -> Body {
+    let (done, gone) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        // `gone` resolves when `Held` drops its sender.
+        let _ = tokio::time::timeout(DOWNLOAD_SLOT_LIMIT, gone).await;
+        drop(permit);
+    });
+    Body::new(Held { body, _done: done })
+}
+
 struct Held {
     body: Body,
-    _permit: Permit,
+    _done: tokio::sync::oneshot::Sender<()>,
 }
 
 impl HttpBody for Held {
@@ -539,18 +566,7 @@ impl HttpBody for Held {
     }
 }
 
-async fn send_file(app: &Arc<App>, sha: &str, size: u64, req: &Parts) -> Response {
-    let headers = &req.headers;
-    if accepts_br(headers)
-        && size <= MAX_BR_FILE
-        && let Some(response) = compressed_file(app, sha, req).await
-    {
-        return response;
-    }
-    let etag = format!("\"{sha}\"");
-    if matches(headers, &etag) {
-        return immutable(headers, Bytes::new(), &etag, "", &[VARY]);
-    }
+async fn send_file(app: &App, sha: &str, etag: String, headers: &HeaderMap) -> Response {
     match open_file(app, sha).await {
         Ok((file, len, content_type)) => {
             let body = Body::from_stream(ReaderStream::with_capacity(file, STREAM_CHUNK));
@@ -586,16 +602,11 @@ async fn open_file(app: &App, sha: &str) -> std::io::Result<(tokio::fs::File, u6
 /// The brotli download, or `None` to send the file as it is. Compression waits for nobody and
 /// spends the client's on-demand tokens: without the free compression slot or a token, or when
 /// compressing fails, the download goes out uncompressed.
-async fn compressed_file(app: &Arc<App>, sha: &str, req: &Parts) -> Option<Response> {
+async fn compressed_file(app: &Arc<App>, sha: &str, etag: String, req: &Parts) -> Option<Response> {
     let headers = &req.headers;
-    let br_headers = [VARY, (header::CONTENT_ENCODING, "br")];
-    let etag = format!("\"{sha}-br\"");
-    if matches(headers, &etag) {
-        return Some(immutable(headers, Bytes::new(), &etag, "", &br_headers));
-    }
     if let Some(cached) = app.files_br.get(sha) {
         inc(&app.metrics.files_br_hits);
-        return Some(respond_cached(headers, &cached, &br_headers));
+        return Some(respond_cached(headers, &cached, &BR_HEADERS));
     }
     let permit = app.br_slot.clone().try_acquire_owned().ok()?;
     app.limiter
@@ -603,6 +614,9 @@ async fn compressed_file(app: &Arc<App>, sha: &str, req: &Parts) -> Option<Respo
         .ok()?;
     inc(&app.metrics.files_br_misses);
     let path = app.store.path(Kind::File, sha);
+    let worker = app.clone();
+    let key = sha.to_owned();
+    // Cached on the compression thread, so the work counts even when the client has gone.
     let compressed = app
         .br_thread
         .run(move || {
@@ -615,23 +629,24 @@ async fn compressed_file(app: &Arc<App>, sha: &str, req: &Parts) -> Option<Respo
                 ..Default::default()
             };
             brotli::BrotliCompress(&mut &bytes[..], &mut out, &params)?;
-            Ok::<_, std::io::Error>((font_type(&bytes), out))
+            let cached = Arc::new(Cached::Ok {
+                body: Bytes::from(out),
+                etag: HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\"")),
+                content_type: font_type(&bytes),
+            });
+            worker
+                .files_br
+                .put(key.clone(), cached.clone(), cached.weight(&key));
+            Ok::<_, std::io::Error>(cached)
         })
         .await
         .and_then(|r| r);
-    let (content_type, out) = match compressed {
-        Ok(done) => done,
+    let cached = match compressed {
+        Ok(cached) => cached,
         Err(e) => {
             eprintln!("compressing file {sha}: {e}");
             return None;
         }
     };
-    let cached = Arc::new(Cached::Ok {
-        body: Bytes::from(out),
-        etag: HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\"")),
-        content_type,
-    });
-    app.files_br
-        .put(sha.to_owned(), cached.clone(), cached.weight(sha));
-    Some(respond_cached(headers, &cached, &br_headers))
+    Some(respond_cached(headers, &cached, &BR_HEADERS))
 }

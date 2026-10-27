@@ -26,6 +26,7 @@ unicode-normalization = "0.1.26"
 write-fonts = { version = "0.55.0", features = ["read"] }
 
 [dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 tempfile = "3"
 ureq = { version = "3", default-features = false }

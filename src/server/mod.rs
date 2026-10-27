@@ -71,20 +71,17 @@ type BrJob = Box<dyn FnOnce() + Send>;
 struct BrThread(std::sync::mpsc::Sender<BrJob>);
 
 impl BrThread {
-    fn spawn() -> Self {
+    fn spawn() -> std::io::Result<Self> {
         let (jobs, rx) = std::sync::mpsc::channel::<BrJob>();
-        let spawned = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("files-br".into())
             .spawn(move || {
                 for job in rx {
                     // A panic drops the job's reply; that download goes out uncompressed.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                 }
-            });
-        if let Err(e) = spawned {
-            eprintln!("no compression thread, file downloads go out uncompressed: {e}");
-        }
-        Self(jobs)
+            })?;
+        Ok(Self(jobs))
     }
 
     async fn run<T: Send + 'static>(
@@ -96,7 +93,7 @@ impl BrThread {
             .send(Box::new(move || {
                 let _ = reply.send(job());
             }))
-            .map_err(|_| std::io::Error::other("no compression thread"))?;
+            .map_err(|_| std::io::Error::other("the compression thread has stopped"))?;
         result
             .await
             .map_err(|_| std::io::Error::other("compression panicked"))
@@ -127,8 +124,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config) -> Arc<Self> {
-        Arc::new(Self {
+    /// Fails only when the compression thread cannot start.
+    pub fn new(config: Config) -> std::io::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
             store: Store::new(&config.fonts_dir),
             current: RwLock::new(None),
             last_error: Mutex::new(None),
@@ -137,14 +135,14 @@ impl App {
             responses: Lru::new(usize::MAX, config.response_cache_bytes),
             files_br: Lru::new(usize::MAX, config.files_br_cache_bytes),
             br_slot: Arc::new(Semaphore::new(1)),
-            br_thread: BrThread::spawn(),
+            br_thread: BrThread::spawn()?,
             limiter: RateLimiter::new(config.rate_per_s, config.burst),
             gate: Gate::new(config.concurrency, config.queue),
             downloads: Gate::new(config.files_concurrency, config.files_queue),
             metrics: Metrics::default(),
             stopping: AtomicBool::new(false),
             config,
-        })
+        }))
     }
 
     /// The generation requests are served from.
@@ -412,7 +410,13 @@ async fn serve(
 }
 
 async fn run(config: Config) -> i32 {
-    let app = App::new(config.clone());
+    let app = match App::new(config.clone()) {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("cannot start the compression thread: {e}");
+            return 1;
+        }
+    };
     reload_in_background(&app).await;
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], config.metrics_port));
