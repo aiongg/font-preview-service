@@ -53,3 +53,16 @@ The image runs the same way under these systemd units and under Kubernetes; the 
 - The server notices a new generation itself by polling `current`; `SIGHUP` reloads at once.
 - `/healthz` is liveness; `/readyz` fails until a manifest is loaded. `SIGTERM` drains open requests, then exits.
 - Metrics are on their own port, not proxied.
+
+## Building the image
+
+The Dockerfile takes the base images as build arguments:
+
+| Argument | Default | Notes |
+|---|---|---|
+| `BUILD_IMAGE` | `rust:1-bookworm` | Needs g++: the build compiles HarfBuzz (C++). |
+| `RUNTIME_IMAGE` | `dhi.io/rust:1` | Needs glibc at least as new as the build image's (Debian 12 here) and libgcc_s. `gcr.io/distroless/cc-debian12:nonroot` works for test builds. |
+
+```sh
+docker build --build-arg RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot -t font-preview-service:test .
+```
