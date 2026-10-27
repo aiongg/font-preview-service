@@ -227,7 +227,8 @@ pub fn run(faces: &[Face], store: &Store, generation: &Path, limits: Limits) -> 
                         precompute_face(face, store, generation)
                     }))
                     .unwrap_or_else(|payload| {
-                        vec![(ALL, Err(format!("panicked: {}", panic_message(&*payload))))]
+                        let reason = format!("panicked: {}", panic_message(&*payload));
+                        (vec![(ALL, Err(reason))], Vec::new())
                     });
                     drop(held);
                     let mut report = report
@@ -250,7 +251,7 @@ pub fn run(faces: &[Face], store: &Store, generation: &Path, limits: Limits) -> 
     report
 }
 
-fn record(report: &mut Report, face: &Face, outcome: Outcome) {
+fn record(report: &mut Report, face: &Face, (outcome, notes): (Outcome, Vec<String>)) {
     for (inst, result) in outcome {
         match result {
             Ok(()) => match inst {
@@ -268,7 +269,7 @@ fn record(report: &mut Report, face: &Face, outcome: Outcome) {
     }
     report
         .warnings
-        .extend(face.warnings.iter().map(|reason| Warning {
+        .extend(face.warnings.iter().chain(&notes).map(|reason| Warning {
             sha256: face.sha256.clone(),
             family: face.family.clone(),
             reason: reason.clone(),
@@ -303,7 +304,7 @@ type Outcome = Vec<(&'static str, Result<(), String>)>;
 #[cfg(test)]
 const PANIC_FAMILY: &str = "panics in precompute";
 
-fn precompute_face(face: &Face, store: &Store, generation: &Path) -> Outcome {
+fn precompute_face(face: &Face, store: &Store, generation: &Path) -> (Outcome, Vec<String>) {
     #[cfg(test)]
     assert_ne!(face.family, PANIC_FAMILY, "test hook");
     let setup = || -> Result<(Vec<u8>, Naming), String> {
@@ -318,11 +319,16 @@ fn precompute_face(face: &Face, store: &Store, generation: &Path) -> Outcome {
     };
     let (font, naming) = match setup() {
         Ok(v) => v,
-        Err(reason) => return vec![(ALL, Err(reason))],
+        Err(reason) => return (vec![(ALL, Err(reason))], Vec::new()),
     };
     let full = match FontRef::new(&font) {
         Ok(full) => full,
-        Err(e) => return vec![(ALL, Err(format!("cannot read font: {e}")))],
+        Err(e) => {
+            return (
+                vec![(ALL, Err(format!("cannot read font: {e}")))],
+                Vec::new(),
+            );
+        }
     };
     let sample_texts = face
         .sample_text
@@ -342,7 +348,31 @@ fn precompute_face(face: &Face, store: &Store, generation: &Path) -> Outcome {
     if face.variable {
         outcome.push(make(VAR, sample_texts.as_deref(), &Instance::Var));
     }
-    outcome
+    let notes = if shapes_with_morx(&full) {
+        vec!["check (c) skipped: font shapes with morx".to_owned()]
+    } else {
+        Vec::new()
+    };
+    (outcome, notes)
+}
+
+/// HarfBuzz and rustybuzz prefer AAT `morx` over `GSUB`. The subset drops `morx`, so the glyph
+/// counts differ legitimately (Chenla, Content and Siemreap: 59 against 62 glyphs in HarfBuzz
+/// itself), and (c) cannot compare them.
+fn shapes_with_morx(font: &FontRef) -> bool {
+    font.table_data(Tag::new(b"morx")).is_some()
+}
+
+/// How far the summed x advance of the subset may differ from the full font's for `glyphs`
+/// glyphs. rustybuzz rounds variable advances and kerning differently from HarfBuzz, one unit per
+/// glyph at most (verified on Figtree, Bricolage Grotesque and Georama, where HarfBuzz gives
+/// identical totals for the subset and the full font). Static fonts and `var` subsets stay exact.
+fn advance_tolerance(variable: bool, instance: &Instance, glyphs: usize) -> i64 {
+    if variable && !matches!(instance, Instance::Var) {
+        i64::try_from(glyphs).unwrap_or(i64::MAX)
+    } else {
+        0
+    }
 }
 
 fn ascii() -> String {
@@ -445,7 +475,11 @@ fn check(
             ));
         }
         let advance = |x: &Shaped| if at_default { x.advance } else { x.nominal };
-        if location.is_some() && (s.glyphs, advance(s)) != (f.glyphs, advance(f)) {
+        let tolerance = advance_tolerance(!full.axes().is_empty(), instance, f.glyphs);
+        if location.is_some()
+            && !shapes_with_morx(full)
+            && (s.glyphs != f.glyphs || (advance(s) - advance(f)).abs() > tolerance)
+        {
             return Err(format!(
                 "check (c) shaping: {text:?} gives {} glyphs advancing {} with the subset, {} \
                  advancing {} with the font",
@@ -573,6 +607,30 @@ mod tests {
         let regular = Instance::Named(Vec::new());
         let err = check(&font, &full, &sfnt, &cps, &texts, &regular).unwrap_err();
         assert!(err.contains("check (c) shaping"), "{err}");
+    }
+
+    #[test]
+    fn advance_tolerance_applies_to_instanced_variable_faces_only() {
+        let named = Instance::Named(Vec::new());
+        assert_eq!(advance_tolerance(true, &named, 12), 12);
+        assert_eq!(advance_tolerance(true, &Instance::Var, 12), 0);
+        assert_eq!(advance_tolerance(false, &Instance::List, 12), 0);
+    }
+
+    #[test]
+    fn morx_is_detected() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/abeezee/ABeeZee-Regular.ttf"
+        ))
+        .unwrap();
+        let plain = FontRef::new(&bytes).unwrap();
+        assert!(!shapes_with_morx(&plain));
+        let mut builder = write_fonts::FontBuilder::new();
+        builder.add_raw(Tag::new(b"morx"), vec![0u8; 8]);
+        builder.copy_missing_tables(plain);
+        let with = builder.build();
+        assert!(shapes_with_morx(&FontRef::new(&with).unwrap()));
     }
 
     #[test]
